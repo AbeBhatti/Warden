@@ -116,7 +116,7 @@ function assertNoRawCredentials(event: Record<string, any>): void {
     if (secret && serialized.includes(secret)) {
       const msg = `HONESTY_VIOLATION: event contains raw credential value`;
       console.error(msg, { event_type: event.event_type, tool: event.tool });
-      throw new Error(msg);
+      process.exit(1);
     }
   }
 }
@@ -807,7 +807,10 @@ app.get("/api/events", (req: Request, res: Response) => {
   const rows = db
     .prepare("SELECT * FROM events WHERE id > ? ORDER BY id ASC LIMIT ?")
     .all(since, limit) as any[];
-  const latest_id = rows.length ? rows[rows.length - 1].id : since;
+  // Always return the DB's actual max id so clients can detect reset
+  // (since<max would indicate the DB was reseeded below the client's watermark).
+  const maxRow = db.prepare("SELECT MAX(id) AS m FROM events").get() as { m: number | null };
+  const latest_id = maxRow.m ?? 0;
   res.json({ events: rows, latest_id });
 });
 
