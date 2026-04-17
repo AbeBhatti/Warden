@@ -1,0 +1,12 @@
+.env
+warden.db
+warden.db-shm
+warden.db-wal
+node_modules/
+.DS_Store
+*.log
+__pycache__/
+*.pyc
+.venv/
+venv/
+dist/
