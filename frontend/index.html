@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Warden</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">WARDEN</div>
+    <div id="conn" class="conn conn-down">
+      <span class="dot"></span><span id="conn-label">Disconnected</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="panel">
+      <h2>Active Capabilities</h2>
+      <div id="caps-empty" class="empty">No active capabilities.</div>
+      <ul id="caps" class="caps"></ul>
+    </section>
+
+    <section class="panel">
+      <h2>Timeline <span class="muted">(live)</span></h2>
+      <div id="events-empty" class="empty">Waiting for events…</div>
+      <ul id="events" class="events"></ul>
+    </section>
+
+    <section class="panel">
+      <h2>Credentials <span class="muted">(registered)</span></h2>
+      <div id="creds-empty" class="empty">No credentials registered.</div>
+      <ul id="creds" class="creds"></ul>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
