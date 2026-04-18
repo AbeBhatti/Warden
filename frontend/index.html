@@ -157,6 +157,14 @@ button{font-family:inherit;cursor:pointer}
 .badge-blue{color:var(--blue);background:var(--blue-bg)}
 .badge-gray{color:var(--muted);background:var(--main)}
 .badge-purple{color:var(--purple);background:var(--purple-bg)}
+/* compliance framework badges (tight, framework-colored) */
+.badge-compliance{display:inline-flex;align-items:center;font-size:8.5px;font-weight:700;letter-spacing:.10em;padding:1px 5px;border-radius:3px;margin-left:3px;border:1px solid currentColor}
+.cf-hipaa{color:var(--red)}
+.cf-pci{color:#fb923c}
+.cf-sox{color:var(--yellow)}
+.cf-gdpr{color:var(--blue)}
+.cf-other{color:var(--text2)}
+.ev-cf-icon{display:inline-block;margin-left:6px;color:var(--yellow);font-size:10px;cursor:help}
 
 /* action buttons */
 .action-btn{font-family:inherit;font-size:9.5px;font-weight:600;padding:4px 10px;border-radius:4px;border:1px solid;cursor:pointer;transition:background .1s}
@@ -358,6 +366,7 @@ button{font-family:inherit;cursor:pointer}
             <button id="policy-refresh-btn" class="action-btn" style="background:var(--blue-bg);color:var(--blue);border:1px solid var(--blue)">REFRESH</button>
             <span id="policy-refresh-msg" class="text-muted" style="font-size:11px"></span>
           </div>
+          <div id="policy-compliance" style="display:none;flex-direction:column;gap:8px"></div>
           <pre id="policy-json" class="mono" style="background:var(--main);border:1px solid var(--card-b);border-radius:6px;padding:10px;font-size:11px;color:var(--text2);max-height:400px;overflow:auto;white-space:pre-wrap"></pre>
         </div>
       </div>
@@ -506,6 +515,22 @@ function envBadge(env){
   if(e==="development")return`<span class="badge badge-blue" title="development policy">${e}</span>`;
   return`<span class="badge badge-gray">${e}</span>`;
 }
+// parse a compliance_tags column (JSON string or null) into a string[]
+function parseComplianceTags(v){
+  if(!v)return[];
+  if(Array.isArray(v))return v;
+  try{const p=JSON.parse(v);return Array.isArray(p)?p:[]}catch{return[]}
+}
+function complianceBadge(tag){
+  const k=String(tag||"").toUpperCase();
+  const cls=k==="HIPAA"?"cf-hipaa":k==="PCI"?"cf-pci":k==="SOX"?"cf-sox":k==="GDPR"?"cf-gdpr":"cf-other";
+  return`<span class="badge-compliance ${cls}" title="Compliance framework: ${k}">${k}</span>`;
+}
+function complianceBadgesHtml(tagsJson){
+  const tags=parseComplianceTags(tagsJson);
+  if(!tags.length)return"";
+  return tags.map(complianceBadge).join("");
+}
 function renderCaps(){
   if(!S.caps.length){
     $capsBody.innerHTML=`<tr class="empty-row"><td colspan="7">No active capabilities.</td></tr>`;
@@ -522,10 +547,11 @@ function renderCaps(){
     const ttlClass=rem<=60?"badge-yellow":"badge-green";
 
     const tr=document.createElement("tr");
+    const cfBadges=complianceBadgesHtml(c.compliance_tags);
     tr.innerHTML=`
       <td class="mono text-blue">${c.id}</td>
       <td>${typeBadge}</td>
-      <td>${envBadge(c.environment)}</td>
+      <td>${envBadge(c.environment)}${cfBadges}</td>
       <td class="mono text-muted" style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${scope}">${scope}</td>
       <td><span class="badge ${ttlClass}" data-expires="${c.expires_at}">${fmtCountdown(rem)}</span></td>
       <td><span class="badge badge-green"><span class="badge-dot"></span>active</span></td>
@@ -604,9 +630,13 @@ function renderSessions(){
         evTr.className=evColorClass(ev);
         evTr.dataset.evid=String(ev.id);
         if(S.openEventIds.has(ev.id))evTr.classList.add("ev-open");
+        const evTags=parseComplianceTags(ev.compliance_tags);
+        const cfIcon=evTags.length
+          ?`<span class="ev-cf-icon" title="compliance: ${evTags.join(", ")}">⚑</span>`
+          :"";
         evTr.innerHTML=`
           <td class="text-muted">${fmtTime(ev.ts)}</td>
-          <td style="font-weight:600">${ev.event_type}</td>
+          <td style="font-weight:600">${ev.event_type}${cfIcon}</td>
           <td class="text-muted" style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${shortDetail(ev)}</td>
           <td>${evBadge(ev)}</td>
           <td class="text-muted">${ev.duration_ms!=null?ev.duration_ms+"ms":"—"}</td>
@@ -625,7 +655,19 @@ function renderSessions(){
             detailTd.colSpan=5;detailTd.style.padding="0";
             const inner=document.createElement("div");inner.className="expand-inner";
             const pre=document.createElement("pre");
-            pre.innerHTML=hlJson({id:ev.id,ts:ev.ts,run_id:ev.run_id,capability_id:ev.capability_id,event_type:ev.event_type,tool:ev.tool,args_redacted:safeJson(ev.args_redacted),outcome:ev.outcome,detail:ev.detail,duration_ms:ev.duration_ms});
+            const cap=ev.capability_id?S.caps.find(c=>c.id===ev.capability_id):null;
+            const capJust=cap&&cap.compliance_justification?safeJson(cap.compliance_justification):null;
+            const detailObj={
+              id:ev.id,ts:ev.ts,run_id:ev.run_id,capability_id:ev.capability_id,
+              event_type:ev.event_type,tool:ev.tool,
+              args_redacted:safeJson(ev.args_redacted),outcome:ev.outcome,
+              detail:ev.detail,duration_ms:ev.duration_ms,
+            };
+            if(evTags.length){
+              detailObj.compliance_tags=evTags;
+              if(capJust)detailObj.compliance_justification=capJust;
+            }
+            pre.innerHTML=hlJson(detailObj);
             inner.appendChild(pre);detailTd.appendChild(inner);detailTr.appendChild(detailTd);
             evTr.after(detailTr);
           }
@@ -774,11 +816,55 @@ function setPolicySource(src){
   }
 }
 
+function renderComplianceFrameworks(cfg){
+  const box=document.getElementById("policy-compliance");
+  const frameworks=cfg&&cfg.compliance_frameworks;
+  if(!frameworks||!Object.keys(frameworks).length){
+    box.style.display="none";box.innerHTML="";return;
+  }
+  box.style.display="flex";
+  const envs=cfg.environments||{};
+  const envLines=Object.keys(envs).map(envName=>{
+    const tags=(envs[envName]&&envs[envName].allowed_compliance_tags)||[];
+    const badges=tags.length
+      ?tags.map(complianceBadge).join("")
+      :`<span class="text-muted" style="font-size:10px">none</span>`;
+    return`<div style="display:flex;align-items:center;gap:8px">
+      <span style="min-width:90px;color:var(--text2);font-size:10.5px;text-transform:uppercase;letter-spacing:.08em">${envName}</span>
+      <span>${badges}</span>
+    </div>`;
+  }).join("");
+  const frameworkCards=Object.keys(frameworks).map(name=>{
+    const f=frameworks[name];
+    const approvalBadge=f.require_approval_on_request
+      ?`<span class="badge badge-red" style="font-size:8.5px">HITL REQUIRED</span>`
+      :`<span class="badge badge-green" style="font-size:8.5px">auto</span>`;
+    const fields=(f.required_justification_fields||[]).map(x=>`<code style="color:var(--blue);font-size:10px">${x}</code>`).join(", ");
+    return`<div style="background:var(--main);border:1px solid var(--card-b);border-radius:6px;padding:10px 12px;display:flex;flex-direction:column;gap:4px">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        ${complianceBadge(name)}
+        <span style="color:var(--text);font-size:11px;font-weight:600">${name}</span>
+        ${approvalBadge}
+        <span class="text-muted" style="font-size:10px">retention: ${f.audit_retention_days}d</span>
+      </div>
+      <div class="text-muted" style="font-size:10.5px">${f.description||""}</div>
+      <div class="text-muted" style="font-size:10.5px">required fields: ${fields||"<em>none</em>"}</div>
+    </div>`;
+  }).join("");
+  box.innerHTML=`
+    <div style="font-size:10.5px;color:var(--text2);text-transform:uppercase;letter-spacing:.12em">Allowed compliance tags per environment</div>
+    <div style="display:flex;flex-direction:column;gap:4px;padding:8px 10px;background:var(--main);border:1px solid var(--card-b);border-radius:6px">${envLines}</div>
+    <div style="font-size:10.5px;color:var(--text2);text-transform:uppercase;letter-spacing:.12em;margin-top:4px">Compliance frameworks</div>
+    <div style="display:flex;flex-direction:column;gap:6px">${frameworkCards}</div>
+  `;
+}
+
 async function loadPolicy(){
   try{
     const d=await getJSON("/api/policy");
     setPolicySource(d.source);
     $policyJson.textContent=JSON.stringify(d.config,null,2);
+    renderComplianceFrameworks(d.config);
     $policyRefreshMsg.textContent=`loaded at ${fmtTime(Date.now())}`;
   }catch{
     $policyRefreshMsg.textContent="load failed (backend unreachable)";

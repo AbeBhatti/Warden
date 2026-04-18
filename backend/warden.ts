@@ -35,11 +35,26 @@ db.exec(schema);
   const colNames = new Set(eventsCols.map((c) => c.name));
   if (!colNames.has("prev_hash")) db.exec("ALTER TABLE events ADD COLUMN prev_hash TEXT");
   if (!colNames.has("event_hash")) db.exec("ALTER TABLE events ADD COLUMN event_hash TEXT");
+  if (!colNames.has("compliance_tags")) db.exec("ALTER TABLE events ADD COLUMN compliance_tags TEXT");
+  if (!colNames.has("hash_version")) {
+    // Legacy rows get hash_version=1 (original serialization). New rows inserted
+    // after this migration are written with hash_version=2.
+    db.exec("ALTER TABLE events ADD COLUMN hash_version INTEGER NOT NULL DEFAULT 1");
+  }
 
   const runsCols = db.prepare("PRAGMA table_info(runs)").all() as { name: string }[];
   const runsColNames = new Set(runsCols.map((c) => c.name));
   if (!runsColNames.has("environment")) {
     db.exec("ALTER TABLE runs ADD COLUMN environment TEXT NOT NULL DEFAULT 'production'");
+  }
+
+  const capsCols = db.prepare("PRAGMA table_info(capabilities)").all() as { name: string }[];
+  const capsColNames = new Set(capsCols.map((c) => c.name));
+  if (!capsColNames.has("compliance_tags")) {
+    db.exec("ALTER TABLE capabilities ADD COLUMN compliance_tags TEXT");
+  }
+  if (!capsColNames.has("compliance_justification")) {
+    db.exec("ALTER TABLE capabilities ADD COLUMN compliance_justification TEXT");
   }
 
   const stateCount = db.prepare("SELECT COUNT(*) AS n FROM audit_chain_state").get() as { n: number };
@@ -179,11 +194,14 @@ type EventRow = {
   outcome: "ok" | "blocked" | "error";
   detail: string | null;
   duration_ms: number | null;
+  compliance_tags: string | null;
 };
 
 type ChainableEventRow = EventRow & { id: number; prev_hash: string };
 
-function computeEventHash(eventRow: ChainableEventRow, prevHash: string): string {
+// V1 serialization: original hash-chain field set (pre-compliance). Kept UNCHANGED so
+// events written before the compliance migration still verify under their stored hash.
+function computeEventHashV1(eventRow: ChainableEventRow, prevHash: string): string {
   const canonical: Record<string, unknown> = {
     id: eventRow.id,
     ts: eventRow.ts,
@@ -201,9 +219,41 @@ function computeEventHash(eventRow: ChainableEventRow, prevHash: string): string
   return createHash("sha256").update(prevHash + "|" + jsonString).digest("hex");
 }
 
+// V2 serialization: adds compliance_tags. Used for events written after the compliance
+// migration. Events carry hash_version=2 so the verifier knows to use this function.
+function computeEventHashV2(eventRow: ChainableEventRow, prevHash: string): string {
+  const canonical: Record<string, unknown> = {
+    id: eventRow.id,
+    ts: eventRow.ts,
+    run_id: eventRow.run_id ?? null,
+    capability_id: eventRow.capability_id ?? null,
+    event_type: eventRow.event_type,
+    tool: eventRow.tool ?? null,
+    args_redacted: eventRow.args_redacted ?? null,
+    outcome: eventRow.outcome,
+    detail: eventRow.detail ?? null,
+    duration_ms: eventRow.duration_ms ?? null,
+    compliance_tags: eventRow.compliance_tags ?? null,
+    prev_hash: prevHash,
+  };
+  const jsonString = JSON.stringify(canonical, Object.keys(canonical).sort());
+  return createHash("sha256").update(prevHash + "|" + jsonString).digest("hex");
+}
+
+function computeEventHashVersioned(
+  eventRow: ChainableEventRow,
+  prevHash: string,
+  hashVersion: number
+): string {
+  if (hashVersion >= 2) return computeEventHashV2(eventRow, prevHash);
+  return computeEventHashV1(eventRow, prevHash);
+}
+
+const CURRENT_HASH_VERSION = 2;
+
 const insertEventStmt = db.prepare(
-  `INSERT INTO events (ts, run_id, capability_id, event_type, tool, args_redacted, outcome, detail, duration_ms, prev_hash)
-   VALUES (@ts, @run_id, @capability_id, @event_type, @tool, @args_redacted, @outcome, @detail, @duration_ms, @prev_hash)`
+  `INSERT INTO events (ts, run_id, capability_id, event_type, tool, args_redacted, outcome, detail, duration_ms, prev_hash, compliance_tags, hash_version)
+   VALUES (@ts, @run_id, @capability_id, @event_type, @tool, @args_redacted, @outcome, @detail, @duration_ms, @prev_hash, @compliance_tags, @hash_version)`
 );
 const updateEventHashStmt = db.prepare("UPDATE events SET event_hash = ? WHERE id = ?");
 const readChainStateStmt = db.prepare("SELECT last_event_hash FROM audit_chain_state WHERE id = 1");
@@ -215,18 +265,37 @@ const emitEventTxn = db.transaction((row: EventRow): number => {
   const state = readChainStateStmt.get() as { last_event_hash: string };
   const prevHash = state.last_event_hash;
 
-  const info = insertEventStmt.run({ ...row, prev_hash: prevHash });
+  const info = insertEventStmt.run({
+    ...row,
+    prev_hash: prevHash,
+    hash_version: CURRENT_HASH_VERSION,
+  });
   const id = Number(info.lastInsertRowid);
 
   const chainable: ChainableEventRow = { ...row, id, prev_hash: prevHash };
-  const eventHash = computeEventHash(chainable, prevHash);
+  const eventHash = computeEventHashVersioned(chainable, prevHash, CURRENT_HASH_VERSION);
 
   updateEventHashStmt.run(eventHash, id);
   updateChainStateStmt.run(id, eventHash);
   return id;
 });
 
+const readCapComplianceStmt = db.prepare(
+  "SELECT compliance_tags FROM capabilities WHERE id = ?"
+);
+
 function emitEvent(e: Partial<EventRow> & Pick<EventRow, "event_type" | "outcome">): number {
+  // If the caller didn't explicitly set compliance_tags but the event is tied to a
+  // capability, propagate the capability's compliance_tags onto the event so every
+  // action performed under a compliance-tagged handle carries the tags in its audit row.
+  let complianceTags = e.compliance_tags ?? null;
+  if (complianceTags == null && e.capability_id) {
+    const row = readCapComplianceStmt.get(e.capability_id) as
+      | { compliance_tags: string | null }
+      | undefined;
+    if (row?.compliance_tags) complianceTags = row.compliance_tags;
+  }
+
   const row: EventRow = {
     ts: Date.now(),
     run_id: e.run_id ?? null,
@@ -237,6 +306,7 @@ function emitEvent(e: Partial<EventRow> & Pick<EventRow, "event_type" | "outcome
     outcome: e.outcome,
     detail: e.detail ?? null,
     duration_ms: e.duration_ms ?? null,
+    compliance_tags: complianceTags,
   };
 
   assertNoRawCredentials(row);
@@ -263,6 +333,8 @@ type CapabilityRow = {
   expires_at: number;
   revoked_at: number | null;
   revocation_reason: string | null;
+  compliance_tags: string | null;
+  compliance_justification: string | null;
 };
 
 function getCapability(handle: string): CapabilityRow | undefined {
@@ -296,16 +368,22 @@ type JsonRpcResponse = {
 // Policy configuration (YAML-driven, per-environment)
 // ─────────────────────────────────────────────────────────────
 
+type ComplianceRules = {
+  min_justification_length?: number;
+};
+
 type CapabilityPolicy = {
   max_ttl_seconds: number;
   allowed_permissions?: string[];
   allowed_models?: string[];
   max_repos_per_run?: number;
   max_tokens_per_call?: number;
+  compliance_rules?: ComplianceRules;
 };
 
 type EnvironmentPolicy = {
   description: string;
+  allowed_compliance_tags?: string[];
   capabilities: {
     github: CapabilityPolicy;
     groq: CapabilityPolicy;
@@ -314,26 +392,37 @@ type EnvironmentPolicy = {
 
 type EnvName = "production" | "staging" | "development";
 
+type ComplianceFramework = {
+  description: string;
+  required_justification_fields: string[];
+  audit_retention_days: number;
+  require_approval_on_request: boolean;
+};
+
 type PolicyConfig = {
   environments: {
     production: EnvironmentPolicy;
     staging: EnvironmentPolicy;
     development: EnvironmentPolicy;
   };
+  compliance_frameworks?: Record<string, ComplianceFramework>;
 };
 
 const PRODUCTION_FALLBACK: EnvironmentPolicy = {
   description: "Fallback production policy (policies.yaml missing or malformed).",
+  allowed_compliance_tags: [],
   capabilities: {
     github: {
       max_ttl_seconds: 900,
       allowed_permissions: ["read", "write"],
       max_repos_per_run: 1,
+      compliance_rules: { min_justification_length: 20 },
     },
     groq: {
       max_ttl_seconds: 300,
       allowed_models: ["llama-3.3-70b-versatile"],
       max_tokens_per_call: 1024,
+      compliance_rules: { min_justification_length: 20 },
     },
   },
 };
@@ -344,6 +433,7 @@ const FALLBACK_POLICY: PolicyConfig = {
     staging: PRODUCTION_FALLBACK,
     development: PRODUCTION_FALLBACK,
   },
+  compliance_frameworks: {},
 };
 
 let policyConfigSource: "yaml" | "fallback" = "fallback";
@@ -392,6 +482,186 @@ function getPolicyForEnv(envName: string): EnvironmentPolicy {
   }
   console.warn(`[Warden] Unknown environment '${envName}', defaulting to production`);
   return policyConfig.environments.production;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Compliance validation
+// ─────────────────────────────────────────────────────────────
+
+type ComplianceValidationResult = {
+  tags: string[];
+  justification: Record<string, any>;
+};
+
+/** Validate compliance_tags + compliance_justification against the environment's
+ * allowed tags and each framework's required_justification_fields. Returns the
+ * normalized tags/justification on success. Throws RpcError with structured
+ * data on any violation. */
+function validateCompliance(
+  run_id: string,
+  runEnv: string,
+  envPolicy: EnvironmentPolicy,
+  capPolicy: CapabilityPolicy,
+  rawTags: any,
+  rawJustification: any
+): ComplianceValidationResult | null {
+  // Not specified (or empty array) → opt-out path, unchanged behavior.
+  const hasTags =
+    rawTags !== undefined && rawTags !== null && Array.isArray(rawTags) && rawTags.length > 0;
+  if (!hasTags) return null;
+
+  const tags: string[] = rawTags.map((t: any) => String(t));
+  const allowed = new Set(envPolicy.allowed_compliance_tags ?? []);
+  const frameworks = policyConfig.compliance_frameworks ?? {};
+
+  // Tag allowed in this environment?
+  for (const tag of tags) {
+    if (!allowed.has(tag)) {
+      emitEvent({
+        run_id,
+        event_type: "capability_denied",
+        outcome: "blocked",
+        detail: `compliance tag '${tag}' not permitted under ${runEnv} policy`,
+      });
+      throw new RpcError(-32001, "Compliance tag not permitted", {
+        code: "COMPLIANCE_TAG_NOT_PERMITTED",
+        message: `compliance tag '${tag}' not permitted in environment '${runEnv}'`,
+        field: "compliance_tags",
+        tag,
+        environment: runEnv,
+        allowed: [...allowed],
+        suggestion: allowed.size
+          ? `Allowed in ${runEnv}: ${[...allowed].join(", ")}`
+          : `No compliance tags are permitted in ${runEnv}`,
+      });
+    }
+    if (!frameworks[tag]) {
+      emitEvent({
+        run_id,
+        event_type: "capability_denied",
+        outcome: "blocked",
+        detail: `compliance framework '${tag}' unknown`,
+      });
+      throw new RpcError(-32001, "Unknown compliance framework", {
+        code: "COMPLIANCE_TAG_NOT_PERMITTED",
+        message: `compliance framework '${tag}' is not defined in policies.yaml`,
+        field: "compliance_tags",
+        tag,
+        suggestion: `Known frameworks: ${Object.keys(frameworks).join(", ") || "(none)"}`,
+      });
+    }
+  }
+
+  // Any framework requires approval? We don't have an approval workflow yet —
+  // surface structured error so agents know this is a HITL-gated path.
+  for (const tag of tags) {
+    if (frameworks[tag].require_approval_on_request) {
+      emitEvent({
+        run_id,
+        event_type: "capability_denied",
+        outcome: "blocked",
+        detail: `compliance framework '${tag}' requires HITL approval (not yet supported)`,
+      });
+      throw new RpcError(-32001, "Compliance approval required", {
+        code: "COMPLIANCE_APPROVAL_REQUIRED",
+        message: `framework '${tag}' requires human approval before a capability can be minted`,
+        field: "compliance_tags",
+        tag,
+        framework: tag,
+        suggestion:
+          "Approval routing is not yet implemented in Warden. In production this would route to a HITL reviewer.",
+      });
+    }
+  }
+
+  // Justification must be an object (structured), not a string or missing.
+  if (
+    rawJustification === undefined ||
+    rawJustification === null ||
+    typeof rawJustification !== "object" ||
+    Array.isArray(rawJustification)
+  ) {
+    emitEvent({
+      run_id,
+      event_type: "capability_denied",
+      outcome: "blocked",
+      detail: `compliance_justification must be a structured object (tags=${tags.join(",")})`,
+    });
+    throw new RpcError(-32001, "Compliance justification required", {
+      code: "COMPLIANCE_JUSTIFICATION_REQUIRED",
+      message:
+        "compliance_justification must be a structured object with framework-specific fields",
+      field: "compliance_justification",
+      compliance_tags: tags,
+      suggestion:
+        "Pass compliance_justification as an object, e.g. {data_subject: 'user_42', lawful_basis: '...'}",
+    });
+  }
+
+  // Union of required fields across all requested frameworks.
+  const requiredByField = new Map<string, string[]>();
+  for (const tag of tags) {
+    for (const field of frameworks[tag].required_justification_fields) {
+      const list = requiredByField.get(field) ?? [];
+      list.push(tag);
+      requiredByField.set(field, list);
+    }
+  }
+
+  const missing: { field: string; frameworks: string[] }[] = [];
+  for (const [field, reqBy] of requiredByField) {
+    const v = (rawJustification as Record<string, any>)[field];
+    if (typeof v !== "string" || v.trim().length === 0) {
+      missing.push({ field, frameworks: reqBy });
+    }
+  }
+  if (missing.length > 0) {
+    emitEvent({
+      run_id,
+      event_type: "capability_denied",
+      outcome: "blocked",
+      detail: `compliance_justification missing fields: ${missing
+        .map((m) => m.field)
+        .join(",")}`,
+    });
+    throw new RpcError(-32001, "Compliance justification incomplete", {
+      code: "COMPLIANCE_JUSTIFICATION_INCOMPLETE",
+      message: `compliance_justification is missing required field(s): ${missing
+        .map((m) => m.field)
+        .join(", ")}`,
+      field: "compliance_justification",
+      compliance_tags: tags,
+      missing_fields: missing,
+      suggestion: `Add the missing fields to compliance_justification: ${missing
+        .map((m) => `${m.field} (required by ${m.frameworks.join(",")})`)
+        .join("; ")}`,
+    });
+  }
+
+  // Per-capability min_justification_length (measured over the serialized object).
+  const minLen = capPolicy.compliance_rules?.min_justification_length;
+  if (typeof minLen === "number" && minLen > 0) {
+    const serialized = JSON.stringify(rawJustification);
+    if (serialized.length < minLen) {
+      emitEvent({
+        run_id,
+        event_type: "capability_denied",
+        outcome: "blocked",
+        detail: `compliance_justification length ${serialized.length} < min ${minLen}`,
+      });
+      throw new RpcError(-32001, "Compliance justification too short", {
+        code: "COMPLIANCE_JUSTIFICATION_INCOMPLETE",
+        message: `compliance_justification serialized length (${serialized.length}) is below min_justification_length (${minLen}) for this environment`,
+        field: "compliance_justification",
+        compliance_tags: tags,
+        min_length: minLen,
+        actual_length: serialized.length,
+        suggestion: `Provide longer justification values (at least ${minLen} chars total when serialized)`,
+      });
+    }
+  }
+
+  return { tags, justification: rawJustification as Record<string, any> };
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -609,26 +879,54 @@ function requestGithubAccess(params: any) {
     }
   }
 
+  const compliance = validateCompliance(
+    run_id,
+    runEnv,
+    envPolicy,
+    ghPolicy,
+    params?.compliance_tags,
+    params?.compliance_justification
+  );
+
   const handle = generateHandle();
   const granted_scope = { repo, permissions };
   const granted_at = nowSec();
   const expires_at = granted_at + ttl;
+  const complianceTagsJson = compliance ? JSON.stringify(compliance.tags) : null;
+  const complianceJustJson = compliance ? JSON.stringify(compliance.justification) : null;
 
   db.prepare(
     `INSERT INTO capabilities
-       (id, run_id, cap_type, credential_id, scope, justification, granted_at, expires_at)
-     VALUES (?, ?, 'github', 'gh_prod', ?, ?, ?, ?)`
-  ).run(handle, run_id, JSON.stringify(granted_scope), justification, granted_at, expires_at);
+       (id, run_id, cap_type, credential_id, scope, justification, granted_at, expires_at, compliance_tags, compliance_justification)
+     VALUES (?, ?, 'github', 'gh_prod', ?, ?, ?, ?, ?, ?)`
+  ).run(
+    handle,
+    run_id,
+    JSON.stringify(granted_scope),
+    justification,
+    granted_at,
+    expires_at,
+    complianceTagsJson,
+    complianceJustJson
+  );
 
   emitEvent({
     run_id,
     capability_id: handle,
     event_type: "capability_granted",
     outcome: "ok",
-    detail: `github repo=${repo} perms=${permissions.join(",")} ttl=${ttl} env=${runEnv}`,
+    detail: compliance
+      ? `github repo=${repo} perms=${permissions.join(",")} ttl=${ttl} env=${runEnv} compliance=${compliance.tags.join(",")}`
+      : `github repo=${repo} perms=${permissions.join(",")} ttl=${ttl} env=${runEnv}`,
+    compliance_tags: complianceTagsJson,
   });
 
-  return { handle, granted_scope, expires_at };
+  return {
+    handle,
+    granted_scope,
+    expires_at,
+    ...(compliance ? { compliance_tags: compliance.tags } : {}),
+  };
 }
 
 function requestGroqAccess(params: any) {
@@ -721,26 +1019,54 @@ function requestGroqAccess(params: any) {
     }
   }
 
+  const compliance = validateCompliance(
+    run_id,
+    runEnv,
+    envPolicy,
+    groqPolicy,
+    params?.compliance_tags,
+    params?.compliance_justification
+  );
+
   const handle = generateHandle();
   const granted_scope = { models, max_tokens_per_call };
   const granted_at = nowSec();
   const expires_at = granted_at + ttl;
+  const complianceTagsJson = compliance ? JSON.stringify(compliance.tags) : null;
+  const complianceJustJson = compliance ? JSON.stringify(compliance.justification) : null;
 
   db.prepare(
     `INSERT INTO capabilities
-       (id, run_id, cap_type, credential_id, scope, justification, granted_at, expires_at)
-     VALUES (?, ?, 'groq', 'groq_prod', ?, ?, ?, ?)`
-  ).run(handle, run_id, JSON.stringify(granted_scope), justification, granted_at, expires_at);
+       (id, run_id, cap_type, credential_id, scope, justification, granted_at, expires_at, compliance_tags, compliance_justification)
+     VALUES (?, ?, 'groq', 'groq_prod', ?, ?, ?, ?, ?, ?)`
+  ).run(
+    handle,
+    run_id,
+    JSON.stringify(granted_scope),
+    justification,
+    granted_at,
+    expires_at,
+    complianceTagsJson,
+    complianceJustJson
+  );
 
   emitEvent({
     run_id,
     capability_id: handle,
     event_type: "capability_granted",
     outcome: "ok",
-    detail: `groq models=${models.join(",")} max_tokens=${max_tokens_per_call} ttl=${ttl} env=${runEnv}`,
+    detail: compliance
+      ? `groq models=${models.join(",")} max_tokens=${max_tokens_per_call} ttl=${ttl} env=${runEnv} compliance=${compliance.tags.join(",")}`
+      : `groq models=${models.join(",")} max_tokens=${max_tokens_per_call} ttl=${ttl} env=${runEnv}`,
+    compliance_tags: complianceTagsJson,
   });
 
-  return { handle, granted_scope, expires_at };
+  return {
+    handle,
+    granted_scope,
+    expires_at,
+    ...(compliance ? { compliance_tags: compliance.tags } : {}),
+  };
 }
 
 // ——— brokered operation pipeline ———
@@ -1132,6 +1458,8 @@ const TOOL_DEFS = [
         },
         justification: { type: "string" },
         ttl_seconds: { type: "number" },
+        compliance_tags: { type: "array", items: { type: "string" } },
+        compliance_justification: { type: "object" },
       },
       required: ["run_id", "scope", "justification"],
       additionalProperties: false,
@@ -1155,6 +1483,8 @@ const TOOL_DEFS = [
         },
         justification: { type: "string" },
         ttl_seconds: { type: "number" },
+        compliance_tags: { type: "array", items: { type: "string" } },
+        compliance_justification: { type: "object" },
       },
       required: ["run_id", "scope", "justification"],
       additionalProperties: false,
@@ -1393,6 +1723,10 @@ const endRunShape = { run_id: z.string().describe("The run_id returned by warden
 // Permissions, models, ttl, and max_tokens are validated against the run's environment
 // policy in the handler so the structured SCOPE_EXCEEDS_CEILING error surfaces the
 // specific field and policy context to the agent.
+// compliance_tags and compliance_justification are validated in the policy handler
+// (structured errors: COMPLIANCE_TAG_NOT_PERMITTED, COMPLIANCE_JUSTIFICATION_REQUIRED,
+// COMPLIANCE_JUSTIFICATION_INCOMPLETE, COMPLIANCE_APPROVAL_REQUIRED) so the schema
+// layer stays loose and the error context reaches the agent.
 const githubAccessShape = {
   run_id: z.string(),
   scope: z.object({
@@ -1401,6 +1735,18 @@ const githubAccessShape = {
   }),
   justification: z.string().describe("Reason the agent needs this access (logged in audit trail)."),
   ttl_seconds: z.number().int().positive().optional(),
+  compliance_tags: z
+    .array(z.string())
+    .optional()
+    .describe(
+      "Compliance frameworks this capability operates under (HIPAA|PCI|SOX|GDPR). Each framework imposes required justification fields and retention rules."
+    ),
+  compliance_justification: z
+    .record(z.string(), z.any())
+    .optional()
+    .describe(
+      "Structured justification object. Required when compliance_tags is non-empty; must contain each framework's required_justification_fields as non-empty strings."
+    ),
 };
 
 const groqAccessShape = {
@@ -1411,6 +1757,8 @@ const groqAccessShape = {
   }),
   justification: z.string(),
   ttl_seconds: z.number().int().positive().optional(),
+  compliance_tags: z.array(z.string()).optional(),
+  compliance_justification: z.record(z.string(), z.any()).optional(),
 };
 
 const listIssuesShape = {
@@ -1551,6 +1899,7 @@ app.get("/api/active_capabilities", (_req: Request, res: Response) => {
   const rows = db
     .prepare(
       `SELECT c.id, c.run_id, c.cap_type, c.scope, c.granted_at, c.expires_at,
+              c.compliance_tags, c.compliance_justification,
               r.environment AS environment
          FROM capabilities c
          LEFT JOIN runs r ON r.id = c.run_id
@@ -1640,13 +1989,18 @@ app.get("/api/audit/chain_state", (_req: Request, res: Response) => {
 app.get("/api/audit/verify", (_req: Request, res: Response) => {
   const rows = db
     .prepare(
-      `SELECT id, ts, run_id, capability_id, event_type, tool, args_redacted, outcome, detail, duration_ms, prev_hash, event_hash
+      `SELECT id, ts, run_id, capability_id, event_type, tool, args_redacted, outcome, detail, duration_ms, prev_hash, event_hash, compliance_tags, hash_version
          FROM events
          WHERE event_hash IS NOT NULL
          ORDER BY id ASC`
     )
     .all() as Array<
-    EventRow & { id: number; prev_hash: string | null; event_hash: string | null }
+    EventRow & {
+      id: number;
+      prev_hash: string | null;
+      event_hash: string | null;
+      hash_version: number | null;
+    }
   >;
 
   const state = db.prepare("SELECT * FROM audit_chain_state WHERE id = 1").get() as
@@ -1672,9 +2026,11 @@ app.get("/api/audit/verify", (_req: Request, res: Response) => {
         events_verified: verified,
       });
     }
-    const recomputed = computeEventHash(
+    const ver = row.hash_version ?? 1;
+    const recomputed = computeEventHashVersioned(
       { ...(row as EventRow), id: row.id, prev_hash: expectedPrevHash },
-      expectedPrevHash
+      expectedPrevHash,
+      ver
     );
     if (recomputed !== row.event_hash) {
       return res.json({
