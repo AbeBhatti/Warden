@@ -28,6 +28,19 @@ const db = new Database(resolve(REPO_ROOT, "warden.db"));
 const schema = readFileSync(resolve(REPO_ROOT, "schema.sql"), "utf8");
 db.exec(schema);
 
+db.exec(`
+  CREATE TABLE IF NOT EXISTS dynamic_tools (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    description TEXT NOT NULL,
+    params TEXT NOT NULL,
+    implementation_hint TEXT,
+    created_at INTEGER NOT NULL,
+    approved_by TEXT NOT NULL,
+    confidence REAL NOT NULL
+  );
+`);
+
 // Idempotent migrations for pre-existing DBs that predate the hash-chain columns.
 // schema.sql already declares these on fresh clones — this brings old DBs up to parity.
 {
@@ -178,7 +191,7 @@ function detectLeak(args: any): { leaked: boolean; fields: string[] } {
       for (const secret of secrets) {
         if (secret && node.includes(secret)) {
           const credType = credentialTypes.get(secret) ?? "unknown";
-          console.log(`[detectLeak] field="${path}" preview="${node.slice(0, 20).replace(/\n/g, "\\n")}" type=${credType}`);
+          console.log(`[detectLeak] field="${path}" length=${node.length} type=${credType}`);
           fields.push(path);
           return;
         }
@@ -1616,6 +1629,75 @@ const TOOL_DEFS = [
   },
 ];
 
+// ─────────────────────────────────────────────────────────────
+// Dynamic tool registry
+// ─────────────────────────────────────────────────────────────
+
+const dynamicToolDefs: Array<{
+  name: string;
+  description: string;
+  params: string[];
+  implementation_hint: string;
+}> = [];
+
+function registerMcpTool(toolDef: {
+  name: string;
+  description: string;
+  params: string[];
+  implementation_hint: string;
+}): void {
+  // Store for future McpServer instances
+  dynamicToolDefs.push(toolDef);
+
+  // Add to METHODS so runTool() and tools/call dispatch can find it
+  METHODS[toolDef.name] = async (args: any) => {
+    emitEvent({
+      run_id: args.run_id || null,
+      capability_id: null,
+      event_type: "tool_called",
+      tool: toolDef.name,
+      args_redacted: JSON.stringify(args),
+      outcome: "ok",
+      detail: `dynamic tool executed: ${toolDef.implementation_hint}`,
+      duration_ms: 0,
+    });
+    return {
+      tool: toolDef.name,
+      args: args,
+      implementation_hint: toolDef.implementation_hint,
+      message: `Dynamic tool ${toolDef.name} executed successfully`,
+    };
+  };
+
+  // Add to TOOL_DEFS so the legacy tools/list response includes it
+  (TOOL_DEFS as any[]).push({
+    name: toolDef.name,
+    description: toolDef.description,
+    inputSchema: {
+      type: "object",
+      properties: Object.fromEntries(
+        toolDef.params.map((p) => [p, { type: "string", description: p }])
+      ),
+      additionalProperties: false,
+    },
+  });
+
+  console.log(`Registered dynamic tool: ${toolDef.name}`);
+}
+
+function loadDynamicTools(): void {
+  const tools = db.prepare("SELECT * FROM dynamic_tools").all() as any[];
+  for (const tool of tools) {
+    registerMcpTool({
+      name: tool.name,
+      description: tool.description,
+      params: JSON.parse(tool.params),
+      implementation_hint: tool.implementation_hint,
+    });
+  }
+  console.log(`Loaded ${tools.length} dynamic tools from DB`);
+}
+
 async function dispatchLegacyRpc(body: any): Promise<JsonRpcResponse> {
   const id = body?.id ?? null;
   const method = body?.method;
@@ -1739,6 +1821,20 @@ app.post("/rpc", async (req: Request, res: Response) => {
 // legacy /rpc dispatcher uses, so the security pipeline is shared.
 // ─────────────────────────────────────────────────────────────
 
+function registerDynamicToolsOnServer(srv: McpServer): void {
+  for (const def of dynamicToolDefs) {
+    const schema: Record<string, z.ZodTypeAny> = {};
+    for (const param of def.params) {
+      schema[param] = z.string().describe(param);
+    }
+    srv.registerTool(
+      def.name,
+      { description: def.description, inputSchema: schema },
+      async (args) => runTool(def.name, args)
+    );
+  }
+}
+
 function buildMcpServer(): McpServer {
   const srv = new McpServer(
     { name: "warden", version: "0.1.0" },
@@ -1752,6 +1848,7 @@ function buildMcpServer(): McpServer {
     }
   );
   registerWardenTools(srv);
+  registerDynamicToolsOnServer(srv);
   return srv;
 }
 
@@ -3628,6 +3725,65 @@ app.post("/api/dsar/subject", (req: Request, res: Response) => {
   });
 });
 
+app.post("/api/tools/register", express.json(), (req: Request, res: Response) => {
+  const { name, description, params, implementation_hint, approved_by, confidence } = req.body;
+
+  if (!name || !description || !params) {
+    return res.status(400).json({ error: "name, description, and params are required" });
+  }
+
+  if (!name.startsWith("warden.")) {
+    return res.status(400).json({ error: "tool name must start with warden." });
+  }
+
+  const existing = db.prepare("SELECT id FROM dynamic_tools WHERE name = ?").get(name);
+  if (existing) {
+    return res.status(409).json({ error: "tool already registered", name });
+  }
+
+  db.prepare(`
+    INSERT INTO dynamic_tools (name, description, params, implementation_hint, created_at, approved_by, confidence)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    name,
+    description,
+    JSON.stringify(params),
+    implementation_hint || "",
+    Math.floor(Date.now() / 1000),
+    approved_by || "tool_forge",
+    confidence || 1.0
+  );
+
+  registerMcpTool({
+    name,
+    description,
+    params,
+    implementation_hint: implementation_hint || "",
+  });
+
+  emitEvent({
+    run_id: null,
+    capability_id: null,
+    event_type: "tool_called",
+    tool: "warden.forge.register",
+    args_redacted: JSON.stringify({ name, description, params }),
+    outcome: "ok",
+    detail: `dynamic tool registered approved_by=${approved_by} confidence=${confidence}`,
+    duration_ms: 0,
+  });
+
+  res.json({
+    status: "registered",
+    name,
+    message: `Tool ${name} is now live and callable via MCP`,
+  });
+});
+
+app.get("/api/tools/dynamic", (_req: Request, res: Response) => {
+  const tools = db.prepare("SELECT * FROM dynamic_tools ORDER BY created_at DESC").all();
+  res.json({ tools });
+});
+
 // ─────────────────────────────────────────────────────────────
 // Timeout sweep — auto-end runs older than 1 hour
 // ─────────────────────────────────────────────────────────────
@@ -3656,6 +3812,8 @@ if (!globalThis.__wardenSweepInterval) {
 // ─────────────────────────────────────────────────────────────
 // Startup
 // ─────────────────────────────────────────────────────────────
+
+loadDynamicTools();
 
 app.listen(PORT, () => {
   console.log(`Warden listening on http://localhost:${PORT}`);
