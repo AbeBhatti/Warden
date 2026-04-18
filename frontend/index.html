@@ -406,6 +406,15 @@ async function pollEvents(){
   try{
     const data=await getJSON(`/api/events?since=${S.lastEventId}&limit=${EVENTS_LIMIT}`);
     setConnected(true);
+    // Backend-restart detection: if DB's max id dropped below our cursor,
+    // the events table was reseeded. Reset so next poll fetches from 0.
+    if(data&&typeof data.latest_id==="number"&&data.latest_id<S.lastEventId){
+      console.info("Warden: backend restart detected, resetting event cursor");
+      S.lastEventId=0;
+      S.eventsByRun.clear();
+      S.openEventIds.clear();
+      renderSessions();
+    }
     if(data?.events?.length){
       let dirty=false;
       for(const ev of data.events){
