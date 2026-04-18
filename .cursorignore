@@ -1,0 +1,5 @@
+# Hackathon / demo: keep secrets out of Cursor AI context (soft barrier).
+# Warden loads .env in its own Node process — not via the agent.
+.env
+.env.*
+*.pem
