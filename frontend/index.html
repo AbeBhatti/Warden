@@ -203,6 +203,29 @@ button{font-family:inherit;cursor:pointer}
 .open .chevron{transform:rotate(90deg)}
 
 .empty-row td{text-align:center;padding:24px;color:var(--muted2);font-style:italic;font-size:11px}
+
+/* ── escape-hatch alerts panel ─────────────────────────────── */
+#alerts-section{display:none;border:1px solid var(--yellow);box-shadow:0 0 0 1px rgba(245,158,11,.15),0 2px 18px rgba(245,158,11,.08)}
+#alerts-section.has-high{border-color:var(--red);box-shadow:0 0 0 1px rgba(239,68,68,.2),0 2px 18px rgba(239,68,68,.1)}
+#alerts-body{display:flex;flex-direction:column;gap:8px;padding:10px 12px}
+.alert-card{display:flex;flex-direction:column;gap:6px;background:var(--main);border:1px solid var(--card-b);border-radius:6px;padding:10px 12px;transition:opacity .25s,transform .25s}
+.alert-card.fading{opacity:0;transform:translateY(-4px)}
+.alert-row1{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.alert-rule{font-size:11.5px;font-weight:600;color:var(--text)}
+.alert-level{font-size:9.5px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;padding:2px 7px;border-radius:10px;border:1px solid}
+.alert-level.low{color:var(--blue);background:var(--blue-bg);border-color:var(--blue)}
+.alert-level.medium{color:var(--yellow);background:var(--yellow-bg);border-color:var(--yellow)}
+.alert-level.high{color:var(--red);background:var(--red-bg);border-color:var(--red);animation:alert-pulse 1.4s ease-in-out infinite}
+@keyframes alert-pulse{0%,100%{box-shadow:0 0 0 0 rgba(239,68,68,.55)}50%{box-shadow:0 0 0 6px rgba(239,68,68,0)}}
+.alert-meta{font-size:10.5px;color:var(--muted)}
+.alert-evidence{font-size:10.5px;color:var(--text2);font-family:inherit}
+.alert-evidence-full{display:none;margin-top:4px;padding:8px;background:var(--sb);border:1px solid var(--card-b);border-radius:4px;white-space:pre-wrap;word-break:break-all;color:var(--text2);font-size:10px}
+.alert-card.expanded .alert-evidence-full{display:block}
+.alert-ack{padding:4px 10px;font-size:10px;font-weight:600;letter-spacing:.06em;background:var(--yellow-bg);color:var(--yellow);border:1px solid var(--yellow);border-radius:4px;margin-left:auto}
+.alert-ack:hover{filter:brightness(1.25)}
+.alert-ack:disabled{opacity:.5;cursor:default}
+.alert-expand{cursor:pointer;font-size:10px;color:var(--muted);user-select:none}
+.alert-expand:hover{color:var(--text2)}
 </style>
 </head>
 <body>
@@ -264,6 +287,15 @@ button{font-family:inherit;cursor:pointer}
           <div class="stat-val" id="stat-sessions">0</div>
           <div class="stat-sub">total runs recorded</div>
         </div>
+      </div>
+
+      <!-- ACTIVE ALERTS (escape-hatch flags) — visible only when unacknowledged flags exist -->
+      <div class="section" id="alerts-section">
+        <div class="section-hdr">
+          <span class="section-title" style="color:var(--yellow)">⚠ Active Alerts</span>
+          <span class="section-badge" id="alerts-badge" style="background:var(--yellow-bg);color:var(--yellow);border-color:var(--yellow)">0 flagged</span>
+        </div>
+        <div id="alerts-body"></div>
       </div>
 
       <!-- active capabilities table -->
@@ -877,8 +909,132 @@ $policyRefreshBtn.addEventListener("click",async()=>{
   $policyRefreshBtn.disabled=false;
 });
 
+// ── escape-hatch alerts panel ─────────────────────────────────────
+const RULE_LABELS={
+  UNUSED_CAPABILITY:"Unused capability",
+  DUPLICATE_CAPABILITY_REQUEST:"Duplicate capability request",
+  SCOPE_ESCALATION_PROBE:"Scope escalation probe",
+  HIGH_DENIAL_RATE:"High denial rate",
+  LEAK_ATTEMPT_BURST:"Leak attempt burst",
+  UNUSUAL_CALL_RATE:"Unusual call rate",
+};
+const $alertsSection=document.getElementById("alerts-section");
+const $alertsBody=document.getElementById("alerts-body");
+const $alertsBadge=document.getElementById("alerts-badge");
+const A={byId:new Map()}; // id -> {flag, node}
+
+function fmtAgoMs(ms){
+  const s=Math.floor((Date.now()-ms*1000)/1000);
+  if(s<5)return"just now";
+  if(s<60)return`${s}s ago`;
+  if(s<3600)return`${Math.floor(s/60)} minute${Math.floor(s/60)===1?"":"s"} ago`;
+  return`${Math.floor(s/3600)}h ago`;
+}
+function evidenceSummary(rule,ev){
+  if(!ev||typeof ev!=="object")return"";
+  switch(rule){
+    case"UNUSED_CAPABILITY":return`cap_type=${ev.cap_type} reason=${ev.revoked_reason}`;
+    case"DUPLICATE_CAPABILITY_REQUEST":return`cap_type=${ev.cap_type} count=${ev.count} in ${ev.window_seconds}s`;
+    case"SCOPE_ESCALATION_PROBE":{
+      const a=Array.isArray(ev.first_scope)?ev.first_scope.join(","):"";
+      const b=Array.isArray(ev.escalated_scope)?ev.escalated_scope.join(","):"";
+      return`${ev.cap_type}: [${a}] → [${b}]`;
+    }
+    case"HIGH_DENIAL_RATE":return`denied=${ev.denied_count} granted=${ev.granted_count}`;
+    case"LEAK_ATTEMPT_BURST":return`${ev.leak_detected_count} leak events in ${ev.window_seconds}s`;
+    case"UNUSUAL_CALL_RATE":return`${ev.tool_calls_in_window} tool calls in ${ev.window_seconds}s`;
+    default:return"";
+  }
+}
+function escapeHtml(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;")}
+function createAlertCard(f){
+  const div=document.createElement("div");
+  div.className="alert-card";
+  div.dataset.id=f.id;
+  const runBadge=envBadge(f.run_environment||"production");
+  const summary=evidenceSummary(f.rule_name,f.evidence);
+  const evJson=JSON.stringify(f.evidence,null,2);
+  div.innerHTML=`
+    <div class="alert-row1">
+      <span class="alert-rule">${escapeHtml(RULE_LABELS[f.rule_name]||f.rule_name)}</span>
+      <span class="alert-level ${escapeHtml(f.level)}">${escapeHtml(f.level)}</span>
+      ${runBadge}
+      <span class="alert-meta" title="${escapeHtml(f.run_id)}">run ${escapeHtml((f.run_id||"").slice(0,8))}…</span>
+      <span class="alert-meta" data-raised="${f.raised_at}">${fmtAgoMs(f.raised_at)}</span>
+      <button class="alert-ack" data-id="${escapeHtml(f.id)}">ACKNOWLEDGE</button>
+    </div>
+    <div class="alert-evidence">
+      <span style="color:var(--muted)">evidence:</span> ${escapeHtml(summary)}
+      <span class="alert-expand" style="margin-left:8px">[details]</span>
+    </div>
+    <pre class="alert-evidence-full">${escapeHtml(evJson)}</pre>
+  `;
+  const ackBtn=div.querySelector(".alert-ack");
+  ackBtn.addEventListener("click",async(e)=>{
+    e.stopPropagation();
+    ackBtn.disabled=true;
+    try{
+      const r=await fetch(`${API_BASE}/api/flags/${encodeURIComponent(f.id)}/acknowledge`,{
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({}),
+      });
+      if(!r.ok&&r.status!==409)throw new Error();
+      div.classList.add("fading");
+      setTimeout(()=>pollFlags(),300);
+    }catch{ackBtn.disabled=false}
+  });
+  const expand=div.querySelector(".alert-expand");
+  expand.addEventListener("click",(e)=>{
+    e.stopPropagation();
+    div.classList.toggle("expanded");
+  });
+  return div;
+}
+function renderAlertsDiff(flags){
+  const nextIds=new Set(flags.map(f=>f.id));
+  // Remove gone cards
+  for(const[id,entry]of A.byId){
+    if(!nextIds.has(id)){
+      entry.node.remove();
+      A.byId.delete(id);
+    }
+  }
+  // Add or update
+  let anyHigh=false;
+  for(const f of flags){
+    if(f.level==="high")anyHigh=true;
+    const existing=A.byId.get(f.id);
+    if(!existing){
+      const node=createAlertCard(f);
+      $alertsBody.appendChild(node);
+      A.byId.set(f.id,{flag:f,node});
+    }else{
+      // refresh the relative timestamp only (avoids flicker)
+      const t=existing.node.querySelector("[data-raised]");
+      if(t)t.textContent=fmtAgoMs(f.raised_at);
+    }
+  }
+  const count=flags.length;
+  $alertsBadge.textContent=`${count} flagged`;
+  if(count===0){
+    $alertsSection.style.display="none";
+    $alertsSection.classList.remove("has-high");
+  }else{
+    $alertsSection.style.display="block";
+    $alertsSection.classList.toggle("has-high",anyHigh);
+  }
+}
+async function pollFlags(){
+  try{
+    const d=await getJSON("/api/flags?status=active");
+    renderAlertsDiff(d?.flags??[]);
+  }catch{}
+  setTimeout(pollFlags,2000);
+}
+
 setConnected(false);
-pollRuns();pollEvents();pollCaps();pollCreds();pollChainState();loadPolicy();
+pollRuns();pollEvents();pollCaps();pollCreds();pollChainState();loadPolicy();pollFlags();
 setInterval(tickTTLs,1000);setInterval(tickUptime,1000);
 </script>
 </body>
