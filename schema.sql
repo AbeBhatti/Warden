@@ -30,6 +30,8 @@ CREATE TABLE IF NOT EXISTS capabilities (
   expires_at INTEGER NOT NULL,
   revoked_at INTEGER,
   revocation_reason TEXT,
+  compliance_tags TEXT,
+  compliance_justification TEXT,
   FOREIGN KEY (run_id) REFERENCES runs(id),
   FOREIGN KEY (credential_id) REFERENCES credentials(id)
 );
@@ -46,7 +48,9 @@ CREATE TABLE IF NOT EXISTS events (
   detail TEXT,
   duration_ms INTEGER,
   prev_hash TEXT,
-  event_hash TEXT
+  event_hash TEXT,
+  compliance_tags TEXT,
+  hash_version INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS audit_chain_state (
