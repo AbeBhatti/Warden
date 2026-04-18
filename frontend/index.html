@@ -269,6 +269,7 @@ button{font-family:inherit;cursor:pointer}
             <tr>
               <th>Handle</th>
               <th>Type</th>
+              <th>Env</th>
               <th>Scope</th>
               <th>Expires</th>
               <th>Status</th>
@@ -276,7 +277,7 @@ button{font-family:inherit;cursor:pointer}
             </tr>
           </thead>
           <tbody id="caps-body">
-            <tr class="empty-row"><td colspan="6">No active capabilities.</td></tr>
+            <tr class="empty-row"><td colspan="7">No active capabilities.</td></tr>
           </tbody>
         </table>
       </div>
@@ -344,6 +345,21 @@ button{font-family:inherit;cursor:pointer}
             <tr class="empty-row"><td colspan="4">No credentials registered.</td></tr>
           </tbody>
         </table>
+      </div>
+
+      <!-- active policy -->
+      <div class="section" id="policy-section">
+        <div class="section-hdr" id="policy-hdr" style="cursor:pointer;user-select:none">
+          <span class="section-title">Active Policy</span>
+          <span class="section-badge" id="policy-source" style="background:var(--card-b);color:var(--text2)">loading…</span>
+        </div>
+        <div id="policy-body" style="padding:12px 14px;display:none;flex-direction:column;gap:10px">
+          <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+            <button id="policy-refresh-btn" class="action-btn" style="background:var(--blue-bg);color:var(--blue);border:1px solid var(--blue)">REFRESH</button>
+            <span id="policy-refresh-msg" class="text-muted" style="font-size:11px"></span>
+          </div>
+          <pre id="policy-json" class="mono" style="background:var(--main);border:1px solid var(--card-b);border-radius:6px;padding:10px;font-size:11px;color:var(--text2);max-height:400px;overflow:auto;white-space:pre-wrap"></pre>
+        </div>
       </div>
 
     </div><!-- /main-body -->
@@ -483,9 +499,16 @@ async function pollCreds(){
 }
 
 // ── render: capabilities ──────────────────────────────────────────
+function envBadge(env){
+  const e=env||"production";
+  if(e==="production")return`<span class="badge badge-red" title="production policy">${e}</span>`;
+  if(e==="staging")return`<span class="badge badge-yellow" title="staging policy">${e}</span>`;
+  if(e==="development")return`<span class="badge badge-blue" title="development policy">${e}</span>`;
+  return`<span class="badge badge-gray">${e}</span>`;
+}
 function renderCaps(){
   if(!S.caps.length){
-    $capsBody.innerHTML=`<tr class="empty-row"><td colspan="6">No active capabilities.</td></tr>`;
+    $capsBody.innerHTML=`<tr class="empty-row"><td colspan="7">No active capabilities.</td></tr>`;
     return;
   }
   const now=Math.floor(Date.now()/1000);
@@ -502,6 +525,7 @@ function renderCaps(){
     tr.innerHTML=`
       <td class="mono text-blue">${c.id}</td>
       <td>${typeBadge}</td>
+      <td>${envBadge(c.environment)}</td>
       <td class="mono text-muted" style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${scope}">${scope}</td>
       <td><span class="badge ${ttlClass}" data-expires="${c.expires_at}">${fmtCountdown(rem)}</span></td>
       <td><span class="badge badge-green"><span class="badge-dot"></span>active</span></td>
@@ -721,8 +745,54 @@ $auditVerifyBtn.addEventListener("click",async()=>{
   }
 });
 
+// ── active policy panel ───────────────────────────────────────────
+const $policyHdr        = document.getElementById("policy-hdr");
+const $policyBody       = document.getElementById("policy-body");
+const $policySource     = document.getElementById("policy-source");
+const $policyJson       = document.getElementById("policy-json");
+const $policyRefreshBtn = document.getElementById("policy-refresh-btn");
+const $policyRefreshMsg = document.getElementById("policy-refresh-msg");
+
+$policyHdr.addEventListener("click",()=>{
+  const open=$policyBody.style.display!=="none";
+  $policyBody.style.display=open?"none":"flex";
+});
+
+function setPolicySource(src){
+  if(src==="yaml"){
+    $policySource.textContent="YAML";
+    $policySource.style.background="var(--green-bg)";
+    $policySource.style.color="var(--green)";
+  } else if(src==="fallback"){
+    $policySource.textContent="FALLBACK";
+    $policySource.style.background="var(--yellow-bg)";
+    $policySource.style.color="var(--yellow)";
+  } else {
+    $policySource.textContent="unknown";
+    $policySource.style.background="var(--card-b)";
+    $policySource.style.color="var(--text2)";
+  }
+}
+
+async function loadPolicy(){
+  try{
+    const d=await getJSON("/api/policy");
+    setPolicySource(d.source);
+    $policyJson.textContent=JSON.stringify(d.config,null,2);
+    $policyRefreshMsg.textContent=`loaded at ${fmtTime(Date.now())}`;
+  }catch{
+    $policyRefreshMsg.textContent="load failed (backend unreachable)";
+  }
+}
+$policyRefreshBtn.addEventListener("click",async()=>{
+  $policyRefreshBtn.disabled=true;
+  $policyRefreshMsg.textContent="loading…";
+  await loadPolicy();
+  $policyRefreshBtn.disabled=false;
+});
+
 setConnected(false);
-pollRuns();pollEvents();pollCaps();pollCreds();pollChainState();
+pollRuns();pollEvents();pollCaps();pollCreds();pollChainState();loadPolicy();
 setInterval(tickTTLs,1000);setInterval(tickUptime,1000);
 </script>
 </body>

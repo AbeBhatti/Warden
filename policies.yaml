@@ -1,0 +1,46 @@
+environments:
+  production:
+    description: "Real customer-facing systems. Minimum blast radius."
+    capabilities:
+      github:
+        max_ttl_seconds: 900
+        allowed_permissions:
+          - read
+          - write
+        max_repos_per_run: 1
+      groq:
+        max_ttl_seconds: 300
+        allowed_models:
+          - llama-3.3-70b-versatile
+        max_tokens_per_call: 1024
+  staging:
+    description: "Pre-production systems. Wider tolerances for testing."
+    capabilities:
+      github:
+        max_ttl_seconds: 3600
+        allowed_permissions:
+          - read
+          - write
+        max_repos_per_run: 5
+      groq:
+        max_ttl_seconds: 1800
+        allowed_models:
+          - llama-3.3-70b-versatile
+          - llama-3.1-8b-instant
+        max_tokens_per_call: 2048
+  development:
+    description: "Local dev and testing. Loose limits for experimentation."
+    capabilities:
+      github:
+        max_ttl_seconds: 3600
+        allowed_permissions:
+          - read
+          - write
+        max_repos_per_run: 20
+      groq:
+        max_ttl_seconds: 3600
+        allowed_models:
+          - llama-3.3-70b-versatile
+          - llama-3.1-8b-instant
+          - mixtral-8x7b-32768
+        max_tokens_per_call: 4096
