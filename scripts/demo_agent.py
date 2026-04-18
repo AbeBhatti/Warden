@@ -83,10 +83,14 @@ def main() -> int:
     time.sleep(1.5)
 
     banner(f"Listing open issues in {DEMO_REPO}")
-    issues = call_mcp(
+    issues_raw = call_mcp(
         "warden.github.list_issues",
         {"handle": gh_handle, "repo": DEMO_REPO, "state": "open"},
     )
+    if isinstance(issues_raw, dict) and "issues" in issues_raw:
+        issues = issues_raw["issues"]
+    else:
+        issues = issues_raw
     if not isinstance(issues, list):
         raise WardenError(f"expected list of issues, got {type(issues).__name__}")
     print(f"  found {len(issues)} open issues")

@@ -1242,4 +1242,64 @@ These are all on the post-hackathon roadmap. They are not MVP work.
 
 ---
 
+## CURRENT PROGRESS (implementation snapshot — for planning & handoff)
+
+*This section documents what was built and how it behaves **as of the hackathon implementation**. It intentionally sits alongside §5–§17; where behavior differs from the original spec, it is called out under **Deviations**.*
+
+### What exists now (inventory)
+
+| Area | Status |
+|------|--------|
+| **Backend** (`backend/warden.ts`) | Single Node process: Express, SQLite (`warden.db` + `schema.sql`), MCP over **HTTP POST `/mcp`** (JSON-RPC 2.0), dashboard REST under `/api/*`. |
+| **MCP protocol** | Supports **`initialize`**, **`notifications/initialized`**, **`tools/list`**, **`tools/call`** (returns `content` + `structuredContent`) **and** legacy direct methods (e.g. `warden.start_run` in `method` field) for scripts. |
+| **Tool naming** | Canonical names use dots (`warden.github.list_issues`). **Underscore aliases** are accepted for Cursor compatibility (`warden_github_list_issues` → same handler). |
+| **Seven brokered tools** | As in §5.1: lifecycle + GitHub + Groq. |
+| **`github.list_issues` shape** | Returns **`{ issues: Issue[] }`** (not a bare JSON array) so MCP clients that expect object-shaped `structuredContent` work reliably. |
+| **Security pipeline** | Inbound **leak detector** on brokered tool args; outbound **sanitizer** on API responses; **honesty assertion** on every `events` insert. |
+| **Credential sync** | **`syncCredentialsFromEnv()`** runs at the start of each brokered call (inside `openPipeline`), **after** handle resolution and **before** leak detection: re-reads repo-root **`.env`** with `override: true`, upserts `credentials` rows, reloads the in-memory secret set. Mitigates **false negatives** when the agent reads a fresh token from disk but the Node process had an older value loaded only at startup. |
+| **Dashboard** | `frontend/index.html`: polls `/api/events`, `/api/active_capabilities`, etc.; dark theme, timeline, capability panel. |
+| **Scripts** | `scripts/demo_agent.py` (happy path), `scripts/attacks.py` (two leak scenarios per PRD §15). |
+| **Project-local Cursor posture** | **`.cursorignore`** — `.env`, `.env.*`, `*.pem` excluded from default AI context (soft barrier). **`.cursor/rules/warden-credential-broker.mdc`** — `alwaysApply: true`; instructs agents to use **only** Warden MCP for GitHub and Groq (no `gh`, no raw `curl` to `api.github.com` / `api.groq.com`, no direct SDK/`requests` for those keys). |
+
+### How it works (end-to-end)
+
+1. **Root secrets** live in **`.env`** (`GITHUB_TOKEN`, `GROQ_API_KEY`) and are registered into SQLite **`credentials`** (`gh_prod`, `groq_prod`) on startup; cache is refreshed on each brokered call via **`syncCredentialsFromEnv`**.
+
+2. **Agent** (Cursor, Python script, or any MCP client) calls **`warden.start_run`** → receives **`run_id`**.
+
+3. Agent calls **`warden.request_github_access`** / **`warden.request_groq_access`** with scope + justification → receives opaque **`handle`** (`cap_*`) and expiry.
+
+4. Agent calls **`warden.github.*`** / **`warden.groq.*`** with **handle + operation args** only. Warden resolves the handle, **syncs env**, runs **leak detection** on args, checks scope, performs the **real** HTTP call with the stored token, **sanitizes** the response, emits **`tool_called`** (or **`leak_detected`** / **`tool_blocked`**), returns sanitized JSON.
+
+5. **`warden.end_run`** revokes all capabilities for the run; optional **timeout sweep** ends stale runs.
+
+**Important:** Warden **does not** sandbox the IDE. If **`GITHUB_TOKEN`** is exported in the shell, or **`gh`** is logged in, the model can still bypass Warden unless **environment + rules** remove those paths. The **`.cursorignore`** + **rules** file are **policy and UX**, not cryptographic isolation.
+
+### Use cases (validated in practice)
+
+| Use case | Description |
+|----------|-------------|
+| **Brokered “happy path”** | Cursor (or script) runs **`start_run` → request GitHub + Groq → list issues → Groq chat_completion → create_comment → end_run** against a real repo (`DEMO_REPO` / e.g. `AbeBhatti/demo`). Proves handles + real API effects + dashboard timeline. |
+| **Scripted demo** | `python scripts/demo_agent.py` — same story without Cursor; reliable for judges if IDE misbehaves. |
+| **Leak / exfil resistance** | **`attacks.py`** or Cursor prompt that attempts to pass **registered** secret substrings in tool args (e.g. token in comment body). Expect **`leak_detected`**, **`LEAK_DETECTED`** error, **no** upstream side effect. |
+| **“Enterprise posture” demo** | Combine **project rules** + **no token in agent shell** + **`.cursorignore`** so the **natural-language** task routes through Warden instead of `gh`/env (best-effort; not foolproof). |
+
+### Deviations from the original PRD (§4 / §5)
+
+| Topic | Original intent | Current state |
+|-------|-----------------|---------------|
+| **“Upgraded agent”** | Claude Code + MCP (§4 table, §5.2 stretch) | **Cursor** with **`user-warden-local`** MCP; same architectural story (real agent, MCP tools). |
+| **MCP transport** | HTTP JSON-RPC (unchanged) | Confirmed: **`POST /mcp`**; also implements MCP **`tools/*`** surface expected by Cursor. |
+| **`list_issues` return type** | PRD shows raw **Issue[]** | Implemented as **`{ issues: Issue[] }`** for MCP **structuredContent** interop. **`demo_agent.py`** unwraps both shapes. |
+| **Leak detection vs stale secrets** | Not spelled out | **`syncCredentialsFromEnv`** added so registered secrets match **on-disk `.env`** before substring checks. |
+| **Credential isolation** | “Agents never hold raw credentials” | **True for brokered MCP path**; **not** enforced against arbitrary file reads or terminal unless **`.cursorignore` / rules / env hygiene** are applied. |
+
+### Gaps / next steps (candidates for follow-on work)
+
+- **Hard isolation** (no `.env` read by agent): separate secret path, VM, or product-level sandbox — out of scope for this repo alone.
+- **Pitch artifacts** (§21): deck PDF, screen recording — confirm completed for submission.
+- **Optional:** run **`attacks.py`** once before demo to confirm **`leak_detected`** on dashboard alongside green path.
+
+---
+
 *End of build PRD. Ship it.*

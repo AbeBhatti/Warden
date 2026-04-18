@@ -1,39 +1,637 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Warden</title>
-  <link rel="stylesheet" href="style.css" />
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>WARDEN</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --sb:        #0a0a0a;
+  --sb-border: #1e1e1e;
+  --sb-text:   #555555;
+  --sb-hover:  #141414;
+  --sb-active: #1c1c1c;
+  --sb-hi:     #c0d8f0;
+  --main:      #111111;
+  --card:      #181818;
+  --card-b:    #252525;
+  --card-b2:   #333333;
+  --text:      #e8e8e8;
+  --text2:     #aaaaaa;
+  --muted:     #666666;
+  --muted2:    #555555;
+  --green:     #22c55e;
+  --green-bg:  #0d2818;
+  --red:       #ef4444;
+  --red-bg:    #2a0f0f;
+  --yellow:    #f59e0b;
+  --yellow-bg: #2a1f05;
+  --blue:      #3b82f6;
+  --blue-bg:   #0d1a30;
+  --blue-dim:  #0d1a30;
+  --purple:    #a78bfa;
+  --purple-bg: #1a1030;
+  --row-hover: #1f1f1f;
+}
+
+html,body{height:100%;background:var(--sb);color:var(--text);font-family:"JetBrains Mono",Menlo,Monaco,Consolas,monospace;font-size:12px;line-height:1.5}
+ul,li{list-style:none}
+button{font-family:inherit;cursor:pointer}
+
+/* ── layout ─────────────────────────────────────────────────── */
+.layout{display:flex;height:100vh;overflow:hidden}
+
+/* ── sidebar ────────────────────────────────────────────────── */
+.sidebar{
+  width:210px;flex-shrink:0;
+  background:var(--sb);
+  border-right:1px solid var(--sb-border);
+  display:flex;flex-direction:column;
+  overflow:hidden;
+}
+
+.sb-logo{
+  display:flex;align-items:center;gap:9px;
+  padding:18px 16px 16px;
+  border-bottom:1px solid var(--sb-border);
+}
+.sb-logo-icon{
+  width:100px;height:100px;flex-shrink:0;
+  object-fit:contain;
+  background:transparent;
+  filter:drop-shadow(0 2px 10px rgba(30,130,240,.55));
+}
+.sb-logo-text{font-size:13px;font-weight:700;letter-spacing:.15em;color:#d8e8f8}
+
+.sb-nav{flex:1;padding:10px 8px;overflow-y:auto}
+.sb-nav::-webkit-scrollbar{display:none}
+
+.sb-section{font-size:8.5px;font-weight:600;letter-spacing:.18em;text-transform:uppercase;color:var(--sb-text);padding:10px 10px 5px}
+
+.sb-item{
+  display:flex;align-items:center;gap:8px;
+  padding:7px 10px;border-radius:5px;
+  color:var(--sb-text);font-size:11.5px;font-weight:500;
+  cursor:pointer;transition:background .1s,color .1s;
+  margin-bottom:1px;
+}
+.sb-item:hover{background:var(--sb-hover);color:#b0cce8}
+.sb-item.active{background:var(--sb-active);color:var(--sb-hi)}
+.sb-item-dot{width:5px;height:5px;border-radius:50%;background:currentColor;flex-shrink:0;margin-left:auto;opacity:.6}
+
+.sb-footer{
+  padding:12px 16px;border-top:1px solid var(--sb-border);
+  display:flex;align-items:center;gap:8px;
+}
+.sb-footer-dot{width:8px;height:8px;border-radius:50%;background:var(--green);flex-shrink:0}
+.sb-footer-label{font-size:10px;color:var(--sb-text)}
+.sb-footer-label span{color:var(--green)}
+
+/* ── main area ───────────────────────────────────────────────── */
+.main{flex:1;background:var(--main);display:flex;flex-direction:column;overflow:hidden}
+
+.main-topbar{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:0 24px;height:52px;
+  background:var(--card);border-bottom:1px solid var(--card-b);flex-shrink:0;
+}
+.main-title{font-size:13px;font-weight:600;color:var(--text);letter-spacing:.02em}
+.main-title span{color:var(--muted);font-weight:400}
+
+.topbar-right{display:flex;align-items:center;gap:14px}
+.conn{display:inline-flex;align-items:center;gap:6px;font-size:10px;color:var(--muted);padding:4px 10px;border-radius:4px;background:var(--main);border:1px solid var(--card-b)}
+.conn .dot{width:7px;height:7px;border-radius:50%;background:var(--red);flex-shrink:0}
+.conn-up .dot{background:var(--green);animation:pulse 2.5s ease-in-out infinite}
+.conn-up #conn-label{color:var(--green)}
+.conn-down #conn-label{color:var(--red)}
+#conn-label{font-size:10px}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.uptime{font-size:10px;color:var(--muted2)}
+
+.main-body{flex:1;overflow-y:auto;padding:20px 24px 32px}
+.main-body::-webkit-scrollbar{width:5px}
+.main-body::-webkit-scrollbar-thumb{background:var(--card-b2);border-radius:3px}
+
+/* ── stat cards ──────────────────────────────────────────────── */
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:22px}
+.stat-card{background:var(--card);border:1px solid var(--card-b);border-radius:8px;padding:16px 18px}
+.stat-label{font-size:9.5px;font-weight:600;letter-spacing:.15em;text-transform:uppercase;color:var(--muted);margin-bottom:6px}
+.stat-val{font-size:24px;font-weight:700;color:var(--text);line-height:1}
+.stat-sub{font-size:10px;color:var(--muted2);margin-top:4px}
+
+/* ── section ─────────────────────────────────────────────────── */
+.section{background:var(--card);border:1px solid var(--card-b);border-radius:8px;margin-bottom:18px;overflow:hidden}
+.section-hdr{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:13px 18px;border-bottom:1px solid var(--card-b);
+}
+.section-title{font-size:11px;font-weight:600;color:var(--text);letter-spacing:.03em}
+.section-badge{font-size:9.5px;color:var(--muted);background:var(--main);border:1px solid var(--card-b);padding:2px 8px;border-radius:12px}
+
+/* ── table ───────────────────────────────────────────────────── */
+.tbl{width:100%;border-collapse:collapse}
+.tbl th{
+  font-size:9px;font-weight:600;letter-spacing:.15em;text-transform:uppercase;
+  color:var(--muted);padding:8px 14px;text-align:left;
+  background:var(--main);border-bottom:1px solid var(--card-b);
+}
+.tbl td{padding:10px 14px;border-bottom:1px solid var(--card-b);font-size:11.5px;color:var(--text2);vertical-align:middle}
+.tbl tr:last-child td{border-bottom:none}
+.tbl tbody tr{transition:background .08s}
+.tbl tbody tr:hover{background:var(--row-hover)}
+
+.mono{font-family:"JetBrains Mono",monospace;font-size:11px}
+.text-blue{color:var(--blue)}
+.text-muted{color:var(--muted)}
+
+/* status badges */
+.badge{display:inline-flex;align-items:center;gap:4px;font-size:9px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;padding:2px 8px;border-radius:10px}
+.badge-dot{width:5px;height:5px;border-radius:50%;background:currentColor;flex-shrink:0}
+.badge-green{color:var(--green);background:var(--green-bg)}
+.badge-red{color:var(--red);background:var(--red-bg)}
+.badge-yellow{color:var(--yellow);background:var(--yellow-bg)}
+.badge-blue{color:var(--blue);background:var(--blue-bg)}
+.badge-gray{color:var(--muted);background:var(--main)}
+.badge-purple{color:var(--purple);background:var(--purple-bg)}
+
+/* action buttons */
+.action-btn{font-family:inherit;font-size:9.5px;font-weight:600;padding:4px 10px;border-radius:4px;border:1px solid;cursor:pointer;transition:background .1s}
+.btn-red{color:var(--red);border-color:rgba(220,38,38,.3);background:transparent}
+.btn-red:hover{background:var(--red-bg)}
+.btn-red:disabled{opacity:.35;cursor:not-allowed}
+.btn-ghost{color:var(--muted);border-color:var(--card-b);background:transparent}
+.btn-ghost:hover{background:var(--main);color:var(--text)}
+
+/* expand row */
+.expand-row td{padding:0;background:#141414}
+.expand-inner{padding:12px 18px 14px 28px;border-top:1px solid var(--card-b)}
+.expand-inner pre{font-size:10.5px;color:var(--text2);white-space:pre-wrap;word-break:break-word;line-height:1.6}
+.expand-inner pre .k{color:var(--blue)}
+.expand-inner pre .s{color:var(--green)}
+.expand-inner pre .n{color:var(--yellow)}
+.expand-inner pre .z{color:var(--muted)}
+
+/* session expand: sub-events table */
+.sub-events{width:100%;border-collapse:collapse;margin-top:0}
+.sub-events th{font-size:8.5px;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);padding:5px 12px;background:#141414;border-bottom:1px solid var(--card-b);text-align:left}
+.sub-events td{padding:6px 12px;font-size:11px;border-bottom:1px solid var(--card-b);color:var(--text2)}
+.sub-events tr:last-child td{border-bottom:none}
+.sub-events tr{cursor:pointer;transition:background .07s}
+.sub-events tr:hover{background:#1f1f1f}
+
+/* ev left strip */
+.ev-strip-green{border-left:2px solid var(--green)}
+.ev-strip-red{border-left:2px solid var(--red)}
+.ev-strip-yellow{border-left:2px solid var(--yellow)}
+
+/* clickable row indicator */
+.row-toggle{cursor:pointer}
+.row-toggle td:first-child{padding-left:10px}
+.chevron{display:inline-block;font-size:9px;color:var(--muted2);transition:transform .15s;margin-right:6px}
+.open .chevron{transform:rotate(90deg)}
+
+.empty-row td{text-align:center;padding:24px;color:var(--muted2);font-style:italic;font-size:11px}
+</style>
 </head>
 <body>
-  <header class="topbar">
-    <div class="brand">WARDEN</div>
-    <div id="conn" class="conn conn-down">
-      <span class="dot"></span><span id="conn-label">Disconnected</span>
+<div class="layout">
+
+  <!-- sidebar -->
+  <aside class="sidebar">
+    <div class="sb-logo">
+      <img src="shield.png" class="sb-logo-icon" alt="Warden"/>
+      <span class="sb-logo-text">WARDEN</span>
     </div>
-  </header>
 
-  <main>
-    <section class="panel">
-      <h2>Active Capabilities</h2>
-      <div id="caps-empty" class="empty">No active capabilities.</div>
-      <ul id="caps" class="caps"></ul>
-    </section>
+    <nav class="sb-nav">
+      <div class="sb-section">Monitor</div>
+      <div class="sb-item active">
+        <span>Dashboard</span>
+      </div>
+      <div class="sb-section">Data</div>
+      <div class="sb-item">Sessions</div>
+      <div class="sb-item">Capabilities</div>
+      <div class="sb-item">Credentials</div>
+    </nav>
 
-    <section class="panel">
-      <h2>Timeline <span class="muted">(live)</span></h2>
-      <div id="events-empty" class="empty">Waiting for events…</div>
-      <ul id="events" class="events"></ul>
-    </section>
+    <div class="sb-footer">
+      <div class="sb-footer-dot" id="conn-dot-sb"></div>
+      <div class="sb-footer-label">MCP <span id="conn-sb-label">offline</span></div>
+    </div>
+  </aside>
 
-    <section class="panel">
-      <h2>Credentials <span class="muted">(registered)</span></h2>
-      <div id="creds-empty" class="empty">No credentials registered.</div>
-      <ul id="creds" class="creds"></ul>
-    </section>
-  </main>
+  <!-- main -->
+  <div class="main">
 
-  <script src="app.js"></script>
+    <div class="main-topbar">
+      <div class="main-title">Warden &nbsp;<span>/ Credential Broker Dashboard</span></div>
+      <div class="topbar-right">
+        <span class="uptime" id="uptime"></span>
+        <div class="conn conn-down" id="conn">
+          <span class="dot"></span><span id="conn-label">Disconnected</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="main-body">
+
+      <!-- stat cards -->
+      <div class="stats">
+        <div class="stat-card">
+          <div class="stat-label">Active Capabilities</div>
+          <div class="stat-val" id="stat-caps">0</div>
+          <div class="stat-sub">live credential handles</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Credentials Registered</div>
+          <div class="stat-val" id="stat-creds">0</div>
+          <div class="stat-sub">values never exposed</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Agent Sessions</div>
+          <div class="stat-val" id="stat-sessions">0</div>
+          <div class="stat-sub">total runs recorded</div>
+        </div>
+      </div>
+
+      <!-- active capabilities table -->
+      <div class="section" id="caps-section">
+        <div class="section-hdr">
+          <span class="section-title">Active Capabilities</span>
+          <span class="section-badge" id="caps-badge">0 active</span>
+        </div>
+        <table class="tbl">
+          <thead>
+            <tr>
+              <th>Handle</th>
+              <th>Type</th>
+              <th>Scope</th>
+              <th>Expires</th>
+              <th>Status</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody id="caps-body">
+            <tr class="empty-row"><td colspan="6">No active capabilities.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- agent sessions -->
+      <div class="section">
+        <div class="section-hdr">
+          <span class="section-title" style="display:flex;align-items:center;gap:7px"><img src="logo-agent.png" style="width:56px;height:56px;object-fit:contain;background:transparent;filter:drop-shadow(0 2px 8px rgba(30,130,240,.5))">Agent Sessions</span>
+          <span class="section-badge" id="sessions-badge">0 sessions</span>
+        </div>
+        <table class="tbl">
+          <thead>
+            <tr>
+              <th style="width:32px"></th>
+              <th>Task</th>
+              <th>Run ID</th>
+              <th>Started</th>
+              <th>Status</th>
+              <th>Events</th>
+            </tr>
+          </thead>
+          <tbody id="sessions-body">
+            <tr class="empty-row"><td colspan="6">No sessions yet. Run the demo agent to start.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- credentials table -->
+      <div class="section">
+        <div class="section-hdr">
+          <span class="section-title" style="display:flex;align-items:center;gap:7px"><img src="logos.png" style="width:58px;height:58px;object-fit:contain;background:transparent;filter:drop-shadow(0 2px 10px rgba(30,130,240,.55))">Credentials</span>
+          <span class="section-badge">values never exposed</span>
+        </div>
+        <table class="tbl">
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Type</th>
+              <th>Registered</th>
+              <th>Value</th>
+            </tr>
+          </thead>
+          <tbody id="creds-body">
+            <tr class="empty-row"><td colspan="4">No credentials registered.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+    </div><!-- /main-body -->
+  </div><!-- /main -->
+</div><!-- /layout -->
+
+<script>
+const API_BASE = (() => {
+  if ((location.protocol==="http:"||location.protocol==="https:")&&location.port==="3000") return "";
+  return "http://localhost:3000";
+})();
+const POLL_MS=1000, RETRY_MS=3000, EVENTS_LIMIT=200;
+
+const S = {
+  lastEventId:0, eventsByRun:new Map(), runs:[],
+  openRunIds:new Set(), openEventIds:new Set(),
+  caps:[], creds:[], connected:false, startedAt:Date.now(),
+};
+
+const $conn        = document.getElementById("conn");
+const $connLabel   = document.getElementById("conn-label");
+const $connDotSb   = document.getElementById("conn-dot-sb");
+const $connSbLabel = document.getElementById("conn-sb-label");
+const $uptime      = document.getElementById("uptime");
+const $capsBody    = document.getElementById("caps-body");
+const $capsBadge   = document.getElementById("caps-badge");
+const $sessionsBody= document.getElementById("sessions-body");
+const $sessionsBadge=document.getElementById("sessions-badge");
+const $credsBody   = document.getElementById("creds-body");
+const $statCaps    = document.getElementById("stat-caps");
+const $statCreds   = document.getElementById("stat-creds");
+const $statSessions= document.getElementById("stat-sessions");
+
+// ── utils ─────────────────────────────────────────────────────────
+function fmtTime(ms){const d=new Date(ms);return[d.getHours(),d.getMinutes(),d.getSeconds()].map(n=>String(n).padStart(2,"0")).join(":")}
+function fmtTimeSec(s){return fmtTime(s*1000)}
+function fmtCountdown(s){if(s<=0)return"expired";return`${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,"0")}`}
+function fmtUptime(ms){const s=Math.floor(ms/1000),m=Math.floor(s/60),h=Math.floor(m/60);if(h>0)return`up ${h}h ${m%60}m`;if(m>0)return`up ${m}m ${s%60}s`;return`up ${s}s`}
+function fmtAgo(sec){const d=Math.floor(Date.now()/1000)-sec;if(d<60)return`${d}s ago`;if(d<3600)return`${Math.floor(d/60)}m ago`;return fmtTimeSec(sec)}
+function safeJson(s){if(s==null)return null;if(typeof s!=="string")return s;try{return JSON.parse(s)}catch{return s}}
+function scopeSummary(t,s){
+  if(!s||typeof s!=="object")return String(s??"");
+  if(t==="github"){const p=Array.isArray(s.permissions)?s.permissions.join(", "):"";return`${s.repo||"?"}  [${p}]`}
+  if(t==="groq"){const m=Array.isArray(s.models)?s.models.join(", "):"";return`${m}${s.max_tokens_per_call!=null?`  max=${s.max_tokens_per_call}`:""}`}
+  try{return JSON.stringify(s)}catch{return String(s)}
+}
+function evColorClass(ev){
+  const t=ev.event_type,o=ev.outcome;
+  if(t==="sanitizer_redacted")return"ev-strip-yellow";
+  if(t==="capability_denied"||t==="tool_blocked"||t==="leak_detected")return"ev-strip-red";
+  if(t==="tool_called")return o==="error"?"ev-strip-red":"ev-strip-green";
+  return"ev-strip-green";
+}
+function evBadge(ev){
+  const t=ev.event_type,o=ev.outcome;
+  if(t==="sanitizer_redacted")return`<span class="badge badge-yellow">warn</span>`;
+  if(t==="capability_denied"||t==="tool_blocked"||t==="leak_detected")return`<span class="badge badge-red">blocked</span>`;
+  if(t==="tool_called"&&o==="error")return`<span class="badge badge-red">error</span>`;
+  return`<span class="badge badge-green">ok</span>`;
+}
+function shortDetail(ev){const p=[];if(ev.tool)p.push(ev.tool);if(ev.detail)p.push(ev.detail);return p.join("  ·  ")}
+function hlJson(o){return JSON.stringify(o,null,2).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/("[\w_]+")\s*:/g,'<span class="k">$1</span>:').replace(/:\s*(".*?")/g,': <span class="s">$1</span>').replace(/:\s*(\d+\.?\d*)/g,': <span class="n">$1</span>').replace(/:\s*(null)/g,': <span class="z">$1</span>')}
+
+// ── network ───────────────────────────────────────────────────────
+async function getJSON(p){const r=await fetch(`${API_BASE}${p}`);if(!r.ok)throw new Error();return r.json()}
+async function postJSON(p){const r=await fetch(`${API_BASE}${p}`,{method:"POST"});if(!r.ok)throw new Error();return r.json()}
+
+function setConnected(up){
+  if(S.connected===up)return;
+  S.connected=up;
+  $conn.classList.toggle("conn-up",up);
+  $conn.classList.toggle("conn-down",!up);
+  $connLabel.textContent=up?"Connected":"Disconnected";
+  $connDotSb.style.background=up?"var(--green)":"var(--red)";
+  $connSbLabel.textContent=up?"live":"offline";
+  $connSbLabel.style.color=up?"var(--green)":"var(--red)";
+}
+
+// ── polling ───────────────────────────────────────────────────────
+async function pollEvents(){
+  try{
+    const data=await getJSON(`/api/events?since=${S.lastEventId}&limit=${EVENTS_LIMIT}`);
+    setConnected(true);
+    if(data?.events?.length){
+      let dirty=false;
+      for(const ev of data.events){
+        if(ev.run_id){
+          if(!S.eventsByRun.has(ev.run_id))S.eventsByRun.set(ev.run_id,[]);
+          const arr=S.eventsByRun.get(ev.run_id);
+          if(!arr.find(e=>e.id===ev.id)){arr.push(ev);dirty=true}
+        }
+        if(ev.id>S.lastEventId)S.lastEventId=ev.id;
+      }
+      if(typeof data.latest_id==="number"&&data.latest_id>S.lastEventId)S.lastEventId=data.latest_id;
+      if(dirty)renderSessions();
+    }
+    setTimeout(pollEvents,POLL_MS);
+  }catch{setConnected(false);setTimeout(pollEvents,RETRY_MS)}
+}
+async function pollRuns(){
+  try{
+    const data=await getJSON("/api/runs?limit=50");
+    setConnected(true);
+    if(data?.runs){S.runs=data.runs;renderSessions();$statSessions.textContent=S.runs.length}
+    setTimeout(pollRuns,2000);
+  }catch{setConnected(false);setTimeout(pollRuns,RETRY_MS)}
+}
+async function pollCaps(){
+  try{
+    const data=await getJSON("/api/active_capabilities");
+    setConnected(true);
+    S.caps=data?.capabilities??[];
+    renderCaps();
+    $statCaps.textContent=S.caps.length;
+    $capsBadge.textContent=`${S.caps.length} active`;
+    setTimeout(pollCaps,POLL_MS);
+  }catch{setConnected(false);setTimeout(pollCaps,RETRY_MS)}
+}
+async function pollCreds(){
+  try{
+    const data=await getJSON("/api/credentials");
+    setConnected(true);
+    S.creds=data?.credentials??[];
+    renderCreds();
+    $statCreds.textContent=S.creds.length;
+    setTimeout(pollCreds,5000);
+  }catch{setConnected(false);setTimeout(pollCreds,RETRY_MS)}
+}
+
+// ── render: capabilities ──────────────────────────────────────────
+function renderCaps(){
+  if(!S.caps.length){
+    $capsBody.innerHTML=`<tr class="empty-row"><td colspan="6">No active capabilities.</td></tr>`;
+    return;
+  }
+  const now=Math.floor(Date.now()/1000);
+  $capsBody.innerHTML="";
+  for(const c of S.caps){
+    const rem=typeof c.seconds_remaining==="number"?c.seconds_remaining:(c.expires_at-now);
+    const scope=scopeSummary(c.cap_type,safeJson(c.scope));
+    const typeBadge=c.cap_type==="groq"
+      ?`<span class="badge badge-purple">${c.cap_type}</span>`
+      :`<span class="badge badge-blue">${c.cap_type}</span>`;
+    const ttlClass=rem<=60?"badge-yellow":"badge-green";
+
+    const tr=document.createElement("tr");
+    tr.innerHTML=`
+      <td class="mono text-blue">${c.id}</td>
+      <td>${typeBadge}</td>
+      <td class="mono text-muted" style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${scope}">${scope}</td>
+      <td><span class="badge ${ttlClass}" data-expires="${c.expires_at}">${fmtCountdown(rem)}</span></td>
+      <td><span class="badge badge-green"><span class="badge-dot"></span>active</span></td>
+      <td><button class="action-btn btn-red" data-id="${c.id}">Revoke</button></td>
+    `;
+    tr.querySelector("button").addEventListener("click",async e=>{
+      const btn=e.currentTarget;btn.disabled=true;
+      try{await postJSON(`/api/revoke/${encodeURIComponent(c.id)}`);S.caps=S.caps.filter(x=>x.id!==c.id);renderCaps();$statCaps.textContent=S.caps.length;$capsBadge.textContent=`${S.caps.length} active`}
+      catch{btn.disabled=false}
+    });
+    $capsBody.appendChild(tr);
+  }
+}
+
+// ── render: sessions ──────────────────────────────────────────────
+function autoExpand(){for(const r of S.runs){if(r.status==="active"){S.openRunIds.add(r.id);return}}}
+
+function renderSessions(){
+  if(S.openRunIds.size===0)autoExpand();
+  const total=S.runs.length;
+  $sessionsBadge.textContent=`${total} session${total!==1?"s":""}`;
+
+  if(!total){
+    $sessionsBody.innerHTML=`<tr class="empty-row"><td colspan="6">No sessions yet. Run the demo agent to start.</td></tr>`;
+    return;
+  }
+  $sessionsBody.innerHTML="";
+
+  for(const run of S.runs){
+    const events=(S.eventsByRun.get(run.id)||[]).slice().sort((a,b)=>a.id-b.id);
+    const isOpen=S.openRunIds.has(run.id);
+    const statusBadge=run.status==="active"
+      ?`<span class="badge badge-green"><span class="badge-dot"></span>active</span>`
+      :run.status==="timeout"
+      ?`<span class="badge badge-yellow">timeout</span>`
+      :`<span class="badge badge-gray">ended</span>`;
+
+    // main row
+    const tr=document.createElement("tr");
+    tr.className=`row-toggle${isOpen?" open":""}`;
+    tr.dataset.id=run.id;
+    tr.innerHTML=`
+      <td><span class="chevron">▶</span></td>
+      <td style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${run.task||""}">${run.task||"(no task)"}</td>
+      <td class="mono text-muted">${run.id.slice(0,8)}...</td>
+      <td class="text-muted">${fmtAgo(run.started_at)}</td>
+      <td>${statusBadge}</td>
+      <td class="text-muted">${events.length}</td>
+    `;
+    tr.addEventListener("click",()=>{
+      if(S.openRunIds.has(run.id)){S.openRunIds.delete(run.id);tr.classList.remove("open")}
+      else{S.openRunIds.add(run.id);tr.classList.add("open")}
+      // toggle expand row visibility
+      const next=tr.nextElementSibling;
+      if(next&&next.classList.contains("expand-row")){
+        next.style.display=S.openRunIds.has(run.id)?"":"none";
+      }
+    });
+    $sessionsBody.appendChild(tr);
+
+    // expand row with sub-events
+    const expTr=document.createElement("tr");
+    expTr.className="expand-row";
+    expTr.style.display=isOpen?"":"none";
+    const expTd=document.createElement("td");
+    expTd.colSpan=6;
+    expTd.style.padding="0";
+
+    if(events.length){
+      const subTable=document.createElement("table");
+      subTable.className="sub-events";
+      subTable.innerHTML=`<thead><tr><th style="width:80px">Time</th><th style="width:200px">Event</th><th>Detail</th><th style="width:70px">Outcome</th><th style="width:80px">Duration</th></tr></thead>`;
+      const tbody=document.createElement("tbody");
+      for(const ev of events){
+        const evTr=document.createElement("tr");
+        evTr.className=evColorClass(ev);
+        evTr.dataset.evid=String(ev.id);
+        if(S.openEventIds.has(ev.id))evTr.classList.add("ev-open");
+        evTr.innerHTML=`
+          <td class="text-muted">${fmtTime(ev.ts)}</td>
+          <td style="font-weight:600">${ev.event_type}</td>
+          <td class="text-muted" style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${shortDetail(ev)}</td>
+          <td>${evBadge(ev)}</td>
+          <td class="text-muted">${ev.duration_ms!=null?ev.duration_ms+"ms":"—"}</td>
+        `;
+        evTr.addEventListener("click",e=>{
+          e.stopPropagation();
+          const next=evTr.nextElementSibling;
+          if(S.openEventIds.has(ev.id)){
+            S.openEventIds.delete(ev.id);
+            if(next&&next.dataset.forEv===String(ev.id))next.remove();
+          } else {
+            S.openEventIds.add(ev.id);
+            const detailTr=document.createElement("tr");
+            detailTr.dataset.forEv=String(ev.id);
+            const detailTd=document.createElement("td");
+            detailTd.colSpan=5;detailTd.style.padding="0";
+            const inner=document.createElement("div");inner.className="expand-inner";
+            const pre=document.createElement("pre");
+            pre.innerHTML=hlJson({id:ev.id,ts:ev.ts,run_id:ev.run_id,capability_id:ev.capability_id,event_type:ev.event_type,tool:ev.tool,args_redacted:safeJson(ev.args_redacted),outcome:ev.outcome,detail:ev.detail,duration_ms:ev.duration_ms});
+            inner.appendChild(pre);detailTd.appendChild(inner);detailTr.appendChild(detailTd);
+            evTr.after(detailTr);
+          }
+        });
+        tbody.appendChild(evTr);
+      }
+      subTable.appendChild(tbody);
+      expTd.appendChild(subTable);
+    } else {
+      expTd.innerHTML=`<div style="padding:12px 18px;font-size:11px;color:var(--muted2);font-style:italic">No events yet for this session.</div>`;
+    }
+    expTr.appendChild(expTd);
+    $sessionsBody.appendChild(expTr);
+  }
+}
+
+// ── render: credentials ───────────────────────────────────────────
+function renderCreds(){
+  if(!S.creds.length){
+    $credsBody.innerHTML=`<tr class="empty-row"><td colspan="4">No credentials registered.</td></tr>`;
+    return;
+  }
+  $credsBody.innerHTML="";
+  for(const c of S.creds){
+    const tr=document.createElement("tr");
+    const typeBadge=c.type==="groq"
+      ?`<span class="badge badge-purple">${c.type}</span>`
+      :`<span class="badge badge-blue">${c.type}</span>`;
+    tr.innerHTML=`
+      <td class="mono text-blue">${c.id}</td>
+      <td>${typeBadge}</td>
+      <td class="text-muted">${fmtTimeSec(c.created_at)}</td>
+      <td><span class="badge badge-gray">[ locked ]</span></td>
+    `;
+    $credsBody.appendChild(tr);
+  }
+}
+
+// ── TTL tick ──────────────────────────────────────────────────────
+function tickTTLs(){
+  const now=Math.floor(Date.now()/1000);
+  $capsBody.querySelectorAll("[data-expires]").forEach(el=>{
+    const rem=Number(el.dataset.expires)-now;
+    el.textContent=fmtCountdown(rem);
+    if(rem<=60){el.className="badge badge-yellow"}else{el.className="badge badge-green"}
+  });
+}
+function tickUptime(){$uptime.textContent=fmtUptime(Date.now()-S.startedAt)}
+
+// ── sidebar nav (scroll to section) ──────────────────────────────
+document.querySelectorAll(".sb-item").forEach(el=>{
+  el.addEventListener("click",()=>{
+    document.querySelectorAll(".sb-item").forEach(x=>x.classList.remove("active"));
+    el.classList.add("active");
+  });
+});
+
+setConnected(false);
+pollRuns();pollEvents();pollCaps();pollCreds();
+setInterval(tickTTLs,1000);setInterval(tickUptime,1000);
+</script>
 </body>
 </html>

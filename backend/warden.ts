@@ -31,14 +31,15 @@ db.exec(schema);
 const nowSec = () => Math.floor(Date.now() / 1000);
 
 function registerCredentialIfMissing(id: string, type: string, value: string) {
-  if (!value) return;
+  const v = value.trim();
+  if (!v) return;
   const existing = db.prepare("SELECT id FROM credentials WHERE id = ?").get(id);
   if (existing) {
-    db.prepare("UPDATE credentials SET value = ? WHERE id = ?").run(value, id);
+    db.prepare("UPDATE credentials SET value = ? WHERE id = ?").run(v, id);
   } else {
     db.prepare(
       "INSERT INTO credentials (id, type, value, scope_ceiling, created_at) VALUES (?, ?, ?, ?, ?)"
-    ).run(id, type, value, null, nowSec());
+    ).run(id, type, v, null, nowSec());
   }
 }
 
@@ -49,9 +50,23 @@ registerCredentialIfMissing("groq_prod", "groq", GROQ_API_KEY);
 let credentialValues: Set<string> = new Set();
 function reloadCredentialCache() {
   const rows = db.prepare("SELECT value FROM credentials").all() as { value: string }[];
-  credentialValues = new Set(rows.map((r) => r.value).filter((v) => v && v.length > 0));
+  credentialValues = new Set(
+    rows.map((r) => r.value.trim()).filter((v) => v.length > 0)
+  );
 }
 reloadCredentialCache();
+
+/** Re-read `.env` from disk and refresh DB + leak/sanitizer cache before brokered calls.
+ * Avoids false negatives when the agent reads a fresh token from disk but the Node process
+ * still had an older credential loaded at startup. */
+function syncCredentialsFromEnv() {
+  dotenv.config({ path: resolve(REPO_ROOT, ".env"), override: true });
+  const gh = (process.env.GITHUB_TOKEN ?? "").trim();
+  const gq = (process.env.GROQ_API_KEY ?? "").trim();
+  if (gh) registerCredentialIfMissing("gh_prod", "github", gh);
+  if (gq) registerCredentialIfMissing("groq_prod", "groq", gq);
+  reloadCredentialCache();
+}
 
 // ─────────────────────────────────────────────────────────────
 // Security pipeline: sanitizer, leak detector, honesty assertion
@@ -204,6 +219,13 @@ class RpcError extends Error {
     this.data = data;
   }
 }
+
+type JsonRpcResponse = {
+  jsonrpc: "2.0";
+  id: any;
+  result?: any;
+  error?: { code: number; message: string; data?: any };
+};
 
 // ─────────────────────────────────────────────────────────────
 // MCP tool implementations
@@ -504,6 +526,7 @@ function openPipeline(
   }
 
   // 2. LEAK DETECTOR (inbound)
+  syncCredentialsFromEnv();
   const leak = detectLeak(rawArgs);
   if (leak.leaked) {
     const argsRedacted = sanitize(rawArgs).sanitized;
@@ -624,7 +647,8 @@ async function githubListIssues(params: any) {
         Date.now() - t0
       );
     }
-    return finalizeOk(ctx, tool, body, Date.now() - t0);
+    const issues = Array.isArray(body) ? body : [];
+    return finalizeOk(ctx, tool, { issues }, Date.now() - t0);
   } catch (err) {
     return finalizeError(ctx, tool, err, Date.now() - t0);
   }
@@ -758,7 +782,139 @@ const METHODS: Record<string, (params: any) => any | Promise<any>> = {
   "warden.groq.chat_completion": groqChatCompletion,
 };
 
-async function dispatchRpc(body: any): Promise<any> {
+/** Cursor/MCP may use underscore tool ids (warden_github_list_issues); map to canonical dotted names. */
+const MCP_TOOL_ALIASES: Record<string, string> = {
+  warden_start_run: "warden.start_run",
+  warden_end_run: "warden.end_run",
+  warden_request_github_access: "warden.request_github_access",
+  warden_request_groq_access: "warden.request_groq_access",
+  warden_github_list_issues: "warden.github.list_issues",
+  warden_github_create_comment: "warden.github.create_comment",
+  warden_groq_chat_completion: "warden.groq.chat_completion",
+};
+
+function resolveToolName(name: string): string {
+  return MCP_TOOL_ALIASES[name] ?? name;
+}
+
+const TOOL_DEFS = [
+  {
+    name: "warden.start_run",
+    description: "Start a security-scoped Warden run.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        task: { type: "string", description: "Task description for this run." },
+      },
+      required: ["task"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "warden.end_run",
+    description: "End a run and revoke all active handles.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        run_id: { type: "string" },
+      },
+      required: ["run_id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "warden.request_github_access",
+    description: "Request time-boxed GitHub credential access for a repo.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        run_id: { type: "string" },
+        scope: {
+          type: "object",
+          properties: {
+            repo: { type: "string" },
+            permissions: { type: "array", items: { type: "string" } },
+          },
+          required: ["repo", "permissions"],
+          additionalProperties: false,
+        },
+        justification: { type: "string" },
+        ttl_seconds: { type: "number" },
+      },
+      required: ["run_id", "scope", "justification"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "warden.request_groq_access",
+    description: "Request time-boxed Groq model access.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        run_id: { type: "string" },
+        scope: {
+          type: "object",
+          properties: {
+            models: { type: "array", items: { type: "string" } },
+            max_tokens_per_call: { type: "number" },
+          },
+          required: ["models"],
+          additionalProperties: false,
+        },
+        justification: { type: "string" },
+        ttl_seconds: { type: "number" },
+      },
+      required: ["run_id", "scope", "justification"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "warden.github.list_issues",
+    description: "List issues for a repo under a granted handle.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        handle: { type: "string" },
+        repo: { type: "string" },
+        state: { type: "string" },
+      },
+      required: ["handle", "repo"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "warden.github.create_comment",
+    description: "Create an issue comment under a write-capable handle.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        handle: { type: "string" },
+        repo: { type: "string" },
+        issue_number: { type: "number" },
+        body: { type: "string" },
+      },
+      required: ["handle", "repo", "issue_number", "body"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "warden.groq.chat_completion",
+    description: "Create a Groq chat completion under a granted handle.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        handle: { type: "string" },
+        messages: { type: "array", items: { type: "object" } },
+        model: { type: "string" },
+        max_tokens: { type: "number" },
+      },
+      required: ["handle", "messages"],
+      additionalProperties: false,
+    },
+  },
+];
+
+async function dispatchLegacyRpc(body: any): Promise<JsonRpcResponse> {
   const id = body?.id ?? null;
   const method = body?.method;
   const params = body?.params ?? {};
@@ -788,6 +944,76 @@ async function dispatchRpc(body: any): Promise<any> {
       error: { code: -32603, message: String(err?.message ?? err) },
     };
   }
+}
+
+async function dispatchRpc(body: any): Promise<JsonRpcResponse> {
+  const id = body?.id ?? null;
+  const method = body?.method;
+  const params = body?.params ?? {};
+
+  if (!method || typeof method !== "string") {
+    return { jsonrpc: "2.0", id, error: { code: -32600, message: "Invalid Request" } };
+  }
+
+  if (method === "initialize") {
+    return {
+      jsonrpc: "2.0",
+      id,
+      result: {
+        protocolVersion: "2024-11-05",
+        serverInfo: { name: "warden-local", version: "0.1.0" },
+        capabilities: { tools: {} },
+      },
+    };
+  }
+
+  if (method === "notifications/initialized") {
+    return { jsonrpc: "2.0", id, result: {} };
+  }
+
+  if (method === "tools/list") {
+    return { jsonrpc: "2.0", id, result: { tools: TOOL_DEFS } };
+  }
+
+  if (method === "tools/call") {
+    const name = resolveToolName(String(params?.name ?? ""));
+    const args = params?.arguments ?? {};
+    const handler = METHODS[name];
+    if (!handler) {
+      return { jsonrpc: "2.0", id, error: { code: -32601, message: `Unknown tool: ${name}` } };
+    }
+    try {
+      const result = await handler(args);
+      return {
+        jsonrpc: "2.0",
+        id,
+        result: {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result),
+            },
+          ],
+          structuredContent: result,
+        },
+      };
+    } catch (err: any) {
+      if (err instanceof RpcError) {
+        return {
+          jsonrpc: "2.0",
+          id,
+          error: { code: err.code, message: err.message, data: err.data },
+        };
+      }
+      return {
+        jsonrpc: "2.0",
+        id,
+        error: { code: -32603, message: String(err?.message ?? err) },
+      };
+    }
+  }
+
+  return dispatchLegacyRpc(body);
 }
 
 // ─────────────────────────────────────────────────────────────
