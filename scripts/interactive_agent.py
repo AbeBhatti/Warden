@@ -27,10 +27,11 @@ try:
 except ImportError:
     pass
 
-WARDEN_URL    = os.environ.get("WARDEN_URL", "http://localhost:3000/mcp")
-GROQ_API_KEY  = os.environ.get("GROQ_API_KEY", "")
-GITHUB_TOKEN  = os.environ.get("GITHUB_TOKEN", "")
-DEMO_REPO     = "AbeBhatti/demo"
+WARDEN_URL        = os.environ.get("WARDEN_URL", "http://localhost:3000/mcp")
+GROQ_API_KEY      = os.environ.get("GROQ_API_KEY", "")
+GITHUB_TOKEN      = os.environ.get("GITHUB_TOKEN", "")
+WARDEN_ENVIRONMENT = os.environ.get("WARDEN_ENV", "development")
+DEMO_REPO         = "AbeBhatti/demo"
 
 
 def call_warden(method: str, params: dict) -> dict:
@@ -84,7 +85,7 @@ You must return ONLY a JSON plan with no markdown, no explanation, no code fence
 Format:
 {{
   "steps": [
-    {{"tool": "warden.start_run", "params": {{"task": "..."}}}},
+    {{"tool": "warden.start_run", "params": {{"task": "...", "environment": "{WARDEN_ENVIRONMENT}"}}}},
     {{"tool": "warden.request_github_access", "params": {{"run_id": "{{{{run_id}}}}", "scope": {{"repo": "{DEMO_REPO}", "permissions": ["read", "write"]}}, "justification": "..."}}}},
     {{"tool": "warden.github.list_issues", "params": {{"handle": "{{{{github_handle}}}}", "repo": "{DEMO_REPO}"}}}},
     {{"tool": "warden.github.create_comment", "params": {{"handle": "{{{{github_handle}}}}", "repo": "{DEMO_REPO}", "issue_number": 1, "body": "..."}}}},
@@ -198,6 +199,9 @@ def execute_plan(plan: dict) -> None:
         tool   = step["tool"]
         params = _replace_placeholders(step.get("params", {}), ctx)
 
+        if tool == "warden.start_run":
+            params.setdefault("environment", WARDEN_ENVIRONMENT)
+
         print(f"  → calling {tool}")
         try:
             result = call_warden(tool, params)
@@ -228,6 +232,7 @@ def main() -> None:
     print("=" * 60)
     print("  WARDEN INTERACTIVE AGENT DEMO")
     print("=" * 60)
+    print(f"Active environment: {WARDEN_ENVIRONMENT}  (override with WARDEN_ENV)")
     print("Type a task for the agent. Warden will allow or block based on what it tries to do.")
     print()
     print('  BENEVOLENT: "Read the open issues and post a short helpful triage comment"')
@@ -282,7 +287,7 @@ def main() -> None:
                         "method": "tools/call",
                         "params": {
                             "name": "warden.start_run",
-                            "arguments": {"task": f"BLOCKED INTENT: {prompt[:100]}"}
+                            "arguments": {"task": f"BLOCKED INTENT: {prompt[:100]}", "environment": WARDEN_ENVIRONMENT}
                         }
                     },
                     headers={

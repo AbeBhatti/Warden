@@ -15,7 +15,8 @@ CREATE TABLE IF NOT EXISTS runs (
   agent_identity TEXT NOT NULL,
   started_at INTEGER NOT NULL,
   ended_at INTEGER,
-  status TEXT NOT NULL
+  status TEXT NOT NULL,
+  environment TEXT NOT NULL DEFAULT 'production'
 );
 
 CREATE TABLE IF NOT EXISTS capabilities (

@@ -2,11 +2,12 @@ import express, { Request, Response } from "express";
 import cors from "cors";
 import Database from "better-sqlite3";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import dotenv from "dotenv";
 import { z } from "zod";
+import * as yaml from "js-yaml";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
@@ -34,6 +35,12 @@ db.exec(schema);
   const colNames = new Set(eventsCols.map((c) => c.name));
   if (!colNames.has("prev_hash")) db.exec("ALTER TABLE events ADD COLUMN prev_hash TEXT");
   if (!colNames.has("event_hash")) db.exec("ALTER TABLE events ADD COLUMN event_hash TEXT");
+
+  const runsCols = db.prepare("PRAGMA table_info(runs)").all() as { name: string }[];
+  const runsColNames = new Set(runsCols.map((c) => c.name));
+  if (!runsColNames.has("environment")) {
+    db.exec("ALTER TABLE runs ADD COLUMN environment TEXT NOT NULL DEFAULT 'production'");
+  }
 
   const stateCount = db.prepare("SELECT COUNT(*) AS n FROM audit_chain_state").get() as { n: number };
   if (stateCount.n === 0) {
@@ -286,39 +293,148 @@ type JsonRpcResponse = {
 };
 
 // ─────────────────────────────────────────────────────────────
+// Policy configuration (YAML-driven, per-environment)
+// ─────────────────────────────────────────────────────────────
+
+type CapabilityPolicy = {
+  max_ttl_seconds: number;
+  allowed_permissions?: string[];
+  allowed_models?: string[];
+  max_repos_per_run?: number;
+  max_tokens_per_call?: number;
+};
+
+type EnvironmentPolicy = {
+  description: string;
+  capabilities: {
+    github: CapabilityPolicy;
+    groq: CapabilityPolicy;
+  };
+};
+
+type EnvName = "production" | "staging" | "development";
+
+type PolicyConfig = {
+  environments: {
+    production: EnvironmentPolicy;
+    staging: EnvironmentPolicy;
+    development: EnvironmentPolicy;
+  };
+};
+
+const PRODUCTION_FALLBACK: EnvironmentPolicy = {
+  description: "Fallback production policy (policies.yaml missing or malformed).",
+  capabilities: {
+    github: {
+      max_ttl_seconds: 900,
+      allowed_permissions: ["read", "write"],
+      max_repos_per_run: 1,
+    },
+    groq: {
+      max_ttl_seconds: 300,
+      allowed_models: ["llama-3.3-70b-versatile"],
+      max_tokens_per_call: 1024,
+    },
+  },
+};
+
+const FALLBACK_POLICY: PolicyConfig = {
+  environments: {
+    production: PRODUCTION_FALLBACK,
+    staging: PRODUCTION_FALLBACK,
+    development: PRODUCTION_FALLBACK,
+  },
+};
+
+let policyConfigSource: "yaml" | "fallback" = "fallback";
+
+function loadPolicyConfig(): PolicyConfig {
+  const policyPath = resolve(REPO_ROOT, "policies.yaml");
+  if (!existsSync(policyPath)) {
+    console.warn("[Warden] policies.yaml not found, using fallback defaults");
+    policyConfigSource = "fallback";
+    return FALLBACK_POLICY;
+  }
+  try {
+    const raw = readFileSync(policyPath, "utf-8");
+    const parsed = yaml.load(raw) as PolicyConfig;
+    if (
+      !parsed?.environments?.production?.capabilities?.github ||
+      !parsed?.environments?.production?.capabilities?.groq ||
+      !parsed?.environments?.staging?.capabilities?.github ||
+      !parsed?.environments?.staging?.capabilities?.groq ||
+      !parsed?.environments?.development?.capabilities?.github ||
+      !parsed?.environments?.development?.capabilities?.groq
+    ) {
+      console.warn("[Warden] policies.yaml malformed, using fallback");
+      policyConfigSource = "fallback";
+      return FALLBACK_POLICY;
+    }
+    policyConfigSource = "yaml";
+    return parsed;
+  } catch (e) {
+    console.warn("[Warden] policies.yaml parse error:", e, "— using fallback");
+    policyConfigSource = "fallback";
+    return FALLBACK_POLICY;
+  }
+}
+
+const policyConfig: PolicyConfig = loadPolicyConfig();
+
+const VALID_ENVIRONMENTS: EnvName[] = ["production", "staging", "development"];
+function isValidEnv(name: string): name is EnvName {
+  return (VALID_ENVIRONMENTS as string[]).includes(name);
+}
+
+function getPolicyForEnv(envName: string): EnvironmentPolicy {
+  if (isValidEnv(envName)) {
+    return policyConfig.environments[envName];
+  }
+  console.warn(`[Warden] Unknown environment '${envName}', defaulting to production`);
+  return policyConfig.environments.production;
+}
+
+// ─────────────────────────────────────────────────────────────
 // MCP tool implementations
 // ─────────────────────────────────────────────────────────────
 
-const GITHUB_PERMS_ALLOWED = new Set(["read", "write"]);
-const GROQ_MODELS_ALLOWED = new Set([
-  "llama-3.3-70b-versatile",
-  "llama-3.1-8b-instant",
-  "mixtral-8x7b-32768",
-]);
-const MAX_TTL = 3600;
 const DEFAULT_TTL_GITHUB = 300;
 const DEFAULT_TTL_GROQ = 300;
-const MAX_GROQ_TOKENS = 4096;
 
 // ——— warden.start_run ———
 function startRun(params: any) {
   const task = String(params?.task ?? "").trim();
   if (!task) throw new RpcError(-32602, "task is required");
 
+  const rawEnv = params?.environment;
+  let environment: EnvName = "production";
+  if (rawEnv !== undefined && rawEnv !== null && rawEnv !== "") {
+    const envStr = String(rawEnv);
+    if (!isValidEnv(envStr)) {
+      throw new RpcError(-32001, "Invalid environment", {
+        code: "INVALID_ENVIRONMENT",
+        message: `environment '${envStr}' is not recognized`,
+        allowed: VALID_ENVIRONMENTS,
+        suggestion: `Use one of: ${VALID_ENVIRONMENTS.join(", ")}`,
+      });
+    }
+    environment = envStr;
+  }
+
   const run_id = randomUUID();
   const agent_identity = randomUUID();
   db.prepare(
-    "INSERT INTO runs (id, task, agent_identity, started_at, status) VALUES (?, ?, ?, ?, 'active')"
-  ).run(run_id, task, agent_identity, nowSec());
+    "INSERT INTO runs (id, task, agent_identity, started_at, status, environment) VALUES (?, ?, ?, ?, 'active', ?)"
+  ).run(run_id, task, agent_identity, nowSec(), environment);
 
   emitEvent({
     run_id,
     event_type: "run_started",
     outcome: "ok",
-    detail: `task=${task}`,
+    detail: `task=${task} environment=${environment}`,
   });
 
-  return { run_id, agent_identity };
+  return { run_id, agent_identity, environment };
 }
 
 // ——— warden.end_run ———
@@ -392,9 +508,36 @@ function requestGithubAccess(params: any) {
   const run_id = String(params?.run_id ?? "");
   const scope = params?.scope ?? {};
   const justification = String(params?.justification ?? "");
-  const ttl = Math.min(Number(params?.ttl_seconds ?? DEFAULT_TTL_GITHUB), MAX_TTL);
 
   validateActiveRun(run_id);
+
+  const runRow = db
+    .prepare("SELECT environment FROM runs WHERE id = ?")
+    .get(run_id) as { environment: string } | undefined;
+  const runEnv = runRow?.environment ?? "production";
+  const envPolicy = getPolicyForEnv(runEnv);
+  const ghPolicy = envPolicy.capabilities.github;
+  const allowedPerms = new Set(ghPolicy.allowed_permissions ?? []);
+  const maxTtl = ghPolicy.max_ttl_seconds;
+
+  const requestedTtl = Number(params?.ttl_seconds ?? DEFAULT_TTL_GITHUB);
+  if (requestedTtl > maxTtl) {
+    emitEvent({
+      run_id,
+      event_type: "capability_denied",
+      outcome: "blocked",
+      detail: `ttl_seconds=${requestedTtl} exceeds ${runEnv} ceiling ${maxTtl}`,
+    });
+    throw new RpcError(-32001, "Scope denied", {
+      code: "SCOPE_EXCEEDS_CEILING",
+      message: `ttl_seconds (${requestedTtl}) exceeds ceiling ${maxTtl}`,
+      field: "ttl_seconds",
+      environment: runEnv,
+      ceiling: maxTtl,
+      suggestion: `Request ttl_seconds <= ${maxTtl} for ${runEnv}`,
+    });
+  }
+  const ttl = requestedTtl;
 
   const repo = String(scope.repo ?? "").trim();
   const permissions: string[] = Array.isArray(scope.permissions) ? scope.permissions : [];
@@ -409,21 +552,59 @@ function requestGithubAccess(params: any) {
     throw new RpcError(-32001, "Scope denied", {
       code: "SCOPE_EXCEEDS_CEILING",
       message: "scope.repo is required",
+      field: "scope.repo",
+      environment: runEnv,
       suggestion: "Pass scope.repo as 'owner/repo'",
     });
   }
   for (const p of permissions) {
-    if (!GITHUB_PERMS_ALLOWED.has(p)) {
+    if (!allowedPerms.has(p)) {
       emitEvent({
         run_id,
         event_type: "capability_denied",
         outcome: "blocked",
-        detail: `disallowed permission: ${p}`,
+        detail: `disallowed permission '${p}' under ${runEnv} policy`,
       });
       throw new RpcError(-32001, "Scope denied", {
         code: "SCOPE_EXCEEDS_CEILING",
-        message: `permission '${p}' not allowed`,
-        suggestion: "Use 'read' and/or 'write'",
+        message: `permission '${p}' not allowed under ${runEnv} policy`,
+        field: "scope.permissions",
+        environment: runEnv,
+        allowed: [...allowedPerms],
+        suggestion: `Allowed: ${[...allowedPerms].join(", ")}`,
+      });
+    }
+  }
+
+  const maxRepos = ghPolicy.max_repos_per_run;
+  if (maxRepos !== undefined) {
+    const granted = db
+      .prepare(
+        "SELECT scope FROM capabilities WHERE run_id = ? AND cap_type = 'github'"
+      )
+      .all(run_id) as { scope: string }[];
+    const distinctRepos = new Set<string>();
+    for (const g of granted) {
+      try {
+        const parsed = JSON.parse(g.scope);
+        if (parsed?.repo) distinctRepos.add(String(parsed.repo));
+      } catch {}
+    }
+    distinctRepos.add(repo);
+    if (distinctRepos.size > maxRepos) {
+      emitEvent({
+        run_id,
+        event_type: "capability_denied",
+        outcome: "blocked",
+        detail: `max_repos_per_run exceeded under ${runEnv} policy (cap=${maxRepos})`,
+      });
+      throw new RpcError(-32001, "Scope denied", {
+        code: "SCOPE_EXCEEDS_CEILING",
+        message: `max_repos_per_run (${maxRepos}) exceeded under ${runEnv} policy`,
+        field: "max_repos_per_run",
+        environment: runEnv,
+        ceiling: maxRepos,
+        suggestion: `End this run and start a new one, or stay under ${maxRepos} distinct repos`,
       });
     }
   }
@@ -444,7 +625,7 @@ function requestGithubAccess(params: any) {
     capability_id: handle,
     event_type: "capability_granted",
     outcome: "ok",
-    detail: `github repo=${repo} perms=${permissions.join(",")} ttl=${ttl}`,
+    detail: `github repo=${repo} perms=${permissions.join(",")} ttl=${ttl} env=${runEnv}`,
   });
 
   return { handle, granted_scope, expires_at };
@@ -454,15 +635,57 @@ function requestGroqAccess(params: any) {
   const run_id = String(params?.run_id ?? "");
   const scope = params?.scope ?? {};
   const justification = String(params?.justification ?? "");
-  const ttl = Math.min(Number(params?.ttl_seconds ?? DEFAULT_TTL_GROQ), MAX_TTL);
 
   validateActiveRun(run_id);
 
+  const runRow = db
+    .prepare("SELECT environment FROM runs WHERE id = ?")
+    .get(run_id) as { environment: string } | undefined;
+  const runEnv = runRow?.environment ?? "production";
+  const envPolicy = getPolicyForEnv(runEnv);
+  const groqPolicy = envPolicy.capabilities.groq;
+  const allowedModels = new Set(groqPolicy.allowed_models ?? []);
+  const maxTtl = groqPolicy.max_ttl_seconds;
+  const maxTokensCeiling = groqPolicy.max_tokens_per_call ?? 1024;
+
+  const requestedTtl = Number(params?.ttl_seconds ?? DEFAULT_TTL_GROQ);
+  if (requestedTtl > maxTtl) {
+    emitEvent({
+      run_id,
+      event_type: "capability_denied",
+      outcome: "blocked",
+      detail: `ttl_seconds=${requestedTtl} exceeds ${runEnv} ceiling ${maxTtl}`,
+    });
+    throw new RpcError(-32001, "Scope denied", {
+      code: "SCOPE_EXCEEDS_CEILING",
+      message: `ttl_seconds (${requestedTtl}) exceeds ceiling ${maxTtl}`,
+      field: "ttl_seconds",
+      environment: runEnv,
+      ceiling: maxTtl,
+      suggestion: `Request ttl_seconds <= ${maxTtl} for ${runEnv}`,
+    });
+  }
+  const ttl = requestedTtl;
+
   const models: string[] = Array.isArray(scope.models) ? scope.models : [];
-  const max_tokens_per_call = Math.min(
-    Number(scope.max_tokens_per_call ?? 1024),
-    MAX_GROQ_TOKENS
-  );
+  const requestedMaxTokens = Number(scope.max_tokens_per_call ?? 1024);
+  if (requestedMaxTokens > maxTokensCeiling) {
+    emitEvent({
+      run_id,
+      event_type: "capability_denied",
+      outcome: "blocked",
+      detail: `max_tokens_per_call=${requestedMaxTokens} exceeds ${runEnv} ceiling ${maxTokensCeiling}`,
+    });
+    throw new RpcError(-32001, "Scope denied", {
+      code: "SCOPE_EXCEEDS_CEILING",
+      message: `max_tokens_per_call (${requestedMaxTokens}) exceeds ceiling ${maxTokensCeiling}`,
+      field: "scope.max_tokens_per_call",
+      environment: runEnv,
+      ceiling: maxTokensCeiling,
+      suggestion: `Request max_tokens_per_call <= ${maxTokensCeiling} for ${runEnv}`,
+    });
+  }
+  const max_tokens_per_call = requestedMaxTokens;
 
   if (models.length === 0) {
     emitEvent({
@@ -474,21 +697,26 @@ function requestGroqAccess(params: any) {
     throw new RpcError(-32001, "Scope denied", {
       code: "SCOPE_EXCEEDS_CEILING",
       message: "scope.models must be non-empty",
+      field: "scope.models",
+      environment: runEnv,
       suggestion: "Specify at least one model",
     });
   }
   for (const m of models) {
-    if (!GROQ_MODELS_ALLOWED.has(m)) {
+    if (!allowedModels.has(m)) {
       emitEvent({
         run_id,
         event_type: "capability_denied",
         outcome: "blocked",
-        detail: `disallowed model: ${m}`,
+        detail: `disallowed model '${m}' under ${runEnv} policy`,
       });
       throw new RpcError(-32001, "Scope denied", {
         code: "SCOPE_EXCEEDS_CEILING",
-        message: `model '${m}' not allowed`,
-        suggestion: `Allowed: ${[...GROQ_MODELS_ALLOWED].join(", ")}`,
+        message: `model '${m}' not allowed under ${runEnv} policy`,
+        field: "scope.models",
+        environment: runEnv,
+        allowed: [...allowedModels],
+        suggestion: `Allowed under ${runEnv}: ${[...allowedModels].join(", ")}`,
       });
     }
   }
@@ -509,7 +737,7 @@ function requestGroqAccess(params: any) {
     capability_id: handle,
     event_type: "capability_granted",
     outcome: "ok",
-    detail: `groq models=${models.join(",")} max_tokens=${max_tokens_per_call} ttl=${ttl}`,
+    detail: `groq models=${models.join(",")} max_tokens=${max_tokens_per_call} ttl=${ttl} env=${runEnv}`,
   });
 
   return { handle, granted_scope, expires_at };
@@ -863,6 +1091,12 @@ const TOOL_DEFS = [
       type: "object",
       properties: {
         task: { type: "string", description: "Task description for this run." },
+        environment: {
+          type: "string",
+          enum: ["production", "staging", "development"],
+          description:
+            "Deployment environment. Controls which policy applies. Defaults to 'production' (strictest).",
+        },
       },
       required: ["task"],
       additionalProperties: false,
@@ -1142,28 +1376,41 @@ async function runTool(name: string, args: Record<string, unknown>) {
 }
 
 // Zod shapes for each tool. Match the existing params shapes the underlying fns accept.
-const startRunShape = { task: z.string().describe("Human-readable description of what this run will do.") };
+// `environment` accepts any string at the zod layer; the handler returns a structured
+// INVALID_ENVIRONMENT error for unrecognized values so agents see the allowed list.
+const startRunShape = {
+  task: z.string().describe("Human-readable description of what this run will do."),
+  environment: z
+    .string()
+    .optional()
+    .describe(
+      "Deployment environment ('production' | 'staging' | 'development'). Controls which policy applies. Defaults to 'production' (strictest)."
+    ),
+};
 
 const endRunShape = { run_id: z.string().describe("The run_id returned by warden.start_run.") };
 
+// Permissions, models, ttl, and max_tokens are validated against the run's environment
+// policy in the handler so the structured SCOPE_EXCEEDS_CEILING error surfaces the
+// specific field and policy context to the agent.
 const githubAccessShape = {
   run_id: z.string(),
   scope: z.object({
     repo: z.string().describe("GitHub repository as 'owner/repo'."),
-    permissions: z.array(z.enum(["read", "write"])),
+    permissions: z.array(z.string()),
   }),
   justification: z.string().describe("Reason the agent needs this access (logged in audit trail)."),
-  ttl_seconds: z.number().int().positive().max(3600).optional(),
+  ttl_seconds: z.number().int().positive().optional(),
 };
 
 const groqAccessShape = {
   run_id: z.string(),
   scope: z.object({
     models: z.array(z.string()),
-    max_tokens_per_call: z.number().int().positive().max(4096).optional(),
+    max_tokens_per_call: z.number().int().positive().optional(),
   }),
   justification: z.string(),
-  ttl_seconds: z.number().int().positive().max(3600).optional(),
+  ttl_seconds: z.number().int().positive().optional(),
 };
 
 const listIssuesShape = {
@@ -1303,14 +1550,17 @@ app.get("/api/active_capabilities", (_req: Request, res: Response) => {
   const now = nowSec();
   const rows = db
     .prepare(
-      `SELECT id, run_id, cap_type, scope, granted_at, expires_at
-         FROM capabilities
-         WHERE revoked_at IS NULL AND expires_at > ?
-         ORDER BY granted_at DESC`
+      `SELECT c.id, c.run_id, c.cap_type, c.scope, c.granted_at, c.expires_at,
+              r.environment AS environment
+         FROM capabilities c
+         LEFT JOIN runs r ON r.id = c.run_id
+         WHERE c.revoked_at IS NULL AND c.expires_at > ?
+         ORDER BY c.granted_at DESC`
     )
     .all(now) as any[];
   const capabilities = rows.map((r) => ({
     ...r,
+    environment: r.environment ?? "production",
     seconds_remaining: Math.max(0, r.expires_at - now),
   }));
   res.json({ capabilities });
@@ -1356,6 +1606,10 @@ app.post("/api/revoke/:cap_id", (req: Request, res: Response) => {
 
 app.get("/api/health", (_req: Request, res: Response) => {
   res.json({ status: "ok", port: PORT });
+});
+
+app.get("/api/policy", (_req: Request, res: Response) => {
+  res.json({ source: policyConfigSource, config: policyConfig });
 });
 
 // ─────────────────────────────────────────────────────────────
