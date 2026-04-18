@@ -41,6 +41,13 @@ db.exec(schema);
     // after this migration are written with hash_version=2.
     db.exec("ALTER TABLE events ADD COLUMN hash_version INTEGER NOT NULL DEFAULT 1");
   }
+  if (!colNames.has("data_subject")) {
+    // Pre-DSAR rows remain NULL; V3 hashing includes data_subject (null for those).
+    db.exec("ALTER TABLE events ADD COLUMN data_subject TEXT");
+  }
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_events_data_subject ON events (data_subject) WHERE data_subject IS NOT NULL"
+  );
 
   const runsCols = db.prepare("PRAGMA table_info(runs)").all() as { name: string }[];
   const runsColNames = new Set(runsCols.map((c) => c.name));
@@ -217,6 +224,7 @@ type EventRow = {
   detail: string | null;
   duration_ms: number | null;
   compliance_tags: string | null;
+  data_subject: string | null;
 };
 
 type ChainableEventRow = EventRow & { id: number; prev_hash: string };
@@ -262,20 +270,43 @@ function computeEventHashV2(eventRow: ChainableEventRow, prevHash: string): stri
   return createHash("sha256").update(prevHash + "|" + jsonString).digest("hex");
 }
 
+// V3 serialization: adds data_subject for GDPR DSAR support. Used for events written
+// after the DSAR migration. Events carry hash_version=3 so the verifier dispatches here.
+function computeEventHashV3(eventRow: ChainableEventRow, prevHash: string): string {
+  const canonical: Record<string, unknown> = {
+    id: eventRow.id,
+    ts: eventRow.ts,
+    run_id: eventRow.run_id ?? null,
+    capability_id: eventRow.capability_id ?? null,
+    event_type: eventRow.event_type,
+    tool: eventRow.tool ?? null,
+    args_redacted: eventRow.args_redacted ?? null,
+    outcome: eventRow.outcome,
+    detail: eventRow.detail ?? null,
+    duration_ms: eventRow.duration_ms ?? null,
+    compliance_tags: eventRow.compliance_tags ?? null,
+    data_subject: eventRow.data_subject ?? null,
+    prev_hash: prevHash,
+  };
+  const jsonString = JSON.stringify(canonical, Object.keys(canonical).sort());
+  return createHash("sha256").update(prevHash + "|" + jsonString).digest("hex");
+}
+
 function computeEventHashVersioned(
   eventRow: ChainableEventRow,
   prevHash: string,
   hashVersion: number
 ): string {
-  if (hashVersion >= 2) return computeEventHashV2(eventRow, prevHash);
+  if (hashVersion >= 3) return computeEventHashV3(eventRow, prevHash);
+  if (hashVersion === 2) return computeEventHashV2(eventRow, prevHash);
   return computeEventHashV1(eventRow, prevHash);
 }
 
-const CURRENT_HASH_VERSION = 2;
+const CURRENT_HASH_VERSION = 3;
 
 const insertEventStmt = db.prepare(
-  `INSERT INTO events (ts, run_id, capability_id, event_type, tool, args_redacted, outcome, detail, duration_ms, prev_hash, compliance_tags, hash_version)
-   VALUES (@ts, @run_id, @capability_id, @event_type, @tool, @args_redacted, @outcome, @detail, @duration_ms, @prev_hash, @compliance_tags, @hash_version)`
+  `INSERT INTO events (ts, run_id, capability_id, event_type, tool, args_redacted, outcome, detail, duration_ms, prev_hash, compliance_tags, hash_version, data_subject)
+   VALUES (@ts, @run_id, @capability_id, @event_type, @tool, @args_redacted, @outcome, @detail, @duration_ms, @prev_hash, @compliance_tags, @hash_version, @data_subject)`
 );
 const updateEventHashStmt = db.prepare("UPDATE events SET event_hash = ? WHERE id = ?");
 const readChainStateStmt = db.prepare("SELECT last_event_hash FROM audit_chain_state WHERE id = 1");
@@ -303,19 +334,41 @@ const emitEventTxn = db.transaction((row: EventRow): number => {
 });
 
 const readCapComplianceStmt = db.prepare(
-  "SELECT compliance_tags FROM capabilities WHERE id = ?"
+  "SELECT compliance_tags, compliance_justification FROM capabilities WHERE id = ?"
 );
+
+function extractDataSubject(justificationRaw: string | null): string | null {
+  if (!justificationRaw) return null;
+  try {
+    const parsed = JSON.parse(justificationRaw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const v = (parsed as Record<string, unknown>).data_subject;
+      if (typeof v === "string" && v.length > 0) return v;
+    }
+  } catch {
+    /* non-JSON justification — no data_subject to propagate */
+  }
+  return null;
+}
 
 function emitEvent(e: Partial<EventRow> & Pick<EventRow, "event_type" | "outcome">): number {
   // If the caller didn't explicitly set compliance_tags but the event is tied to a
   // capability, propagate the capability's compliance_tags onto the event so every
   // action performed under a compliance-tagged handle carries the tags in its audit row.
+  // Same pattern applies to data_subject (pulled from compliance_justification).
   let complianceTags = e.compliance_tags ?? null;
-  if (complianceTags == null && e.capability_id) {
+  let dataSubject = e.data_subject ?? null;
+  if ((complianceTags == null || dataSubject == null) && e.capability_id) {
     const row = readCapComplianceStmt.get(e.capability_id) as
-      | { compliance_tags: string | null }
+      | { compliance_tags: string | null; compliance_justification: string | null }
       | undefined;
-    if (row?.compliance_tags) complianceTags = row.compliance_tags;
+    if (row) {
+      if (complianceTags == null && row.compliance_tags) complianceTags = row.compliance_tags;
+      if (dataSubject == null) {
+        const ds = extractDataSubject(row.compliance_justification);
+        if (ds) dataSubject = ds;
+      }
+    }
   }
 
   const row: EventRow = {
@@ -329,6 +382,7 @@ function emitEvent(e: Partial<EventRow> & Pick<EventRow, "event_type" | "outcome
     detail: e.detail ?? null,
     duration_ms: e.duration_ms ?? null,
     compliance_tags: complianceTags,
+    data_subject: dataSubject,
   };
 
   assertNoRawCredentials(row);
@@ -2096,7 +2150,7 @@ app.get("/api/audit/chain_state", (_req: Request, res: Response) => {
 app.get("/api/audit/verify", (_req: Request, res: Response) => {
   const rows = db
     .prepare(
-      `SELECT id, ts, run_id, capability_id, event_type, tool, args_redacted, outcome, detail, duration_ms, prev_hash, event_hash, compliance_tags, hash_version
+      `SELECT id, ts, run_id, capability_id, event_type, tool, args_redacted, outcome, detail, duration_ms, prev_hash, event_hash, compliance_tags, hash_version, data_subject
          FROM events
          WHERE event_hash IS NOT NULL
          ORDER BY id ASC`
@@ -2516,7 +2570,7 @@ type ChainVerificationResult =
 function verifyChainInternal(): ChainVerificationResult {
   const rows = db
     .prepare(
-      `SELECT id, ts, run_id, capability_id, event_type, tool, args_redacted, outcome, detail, duration_ms, prev_hash, event_hash, compliance_tags, hash_version
+      `SELECT id, ts, run_id, capability_id, event_type, tool, args_redacted, outcome, detail, duration_ms, prev_hash, event_hash, compliance_tags, hash_version, data_subject
          FROM events
          WHERE event_hash IS NOT NULL
          ORDER BY id ASC`
@@ -2869,12 +2923,17 @@ function reportHonestyAudit(opts: { startSec: number; endSec: number }): {
       "SELECT COUNT(*) AS n FROM events WHERE ts >= ? AND ts <= ? AND hash_version = 2 AND event_hash IS NOT NULL"
     )
     .get(startMs, endMs) as { n: number };
+  const v3Count = db
+    .prepare(
+      "SELECT COUNT(*) AS n FROM events WHERE ts >= ? AND ts <= ? AND hash_version = 3 AND event_hash IS NOT NULL"
+    )
+    .get(startMs, endMs) as { n: number };
 
   // Sampled integrity check: up to 20 random chained events in the period.
   const sample = db
     .prepare(
       `SELECT id, ts, run_id, capability_id, event_type, tool, args_redacted, outcome, detail,
-              duration_ms, prev_hash, event_hash, compliance_tags, hash_version
+              duration_ms, prev_hash, event_hash, compliance_tags, hash_version, data_subject
          FROM events
         WHERE event_hash IS NOT NULL AND ts >= ? AND ts <= ?
         ORDER BY RANDOM()
@@ -2951,6 +3010,7 @@ function reportHonestyAudit(opts: { startSec: number; endSec: number }): {
     `- Events excluded from chain (pre-migration, hash_version IS NULL or hash missing): ${excluded.n}`,
     `- Events chained under V1 serialization: ${v1Count.n}`,
     `- Events chained under V2 serialization: ${v2Count.n}`,
+    `- Events chained under V3 serialization: ${v3Count.n}`,
     "",
     "### Sampled integrity check",
     `- Sample size: ${sample.length}`,
@@ -3297,6 +3357,273 @@ app.post("/api/reports/generate", (req: Request, res: Response) => {
       chain_status: chainStatusString(verify),
       total_capabilities_in_period: built.total_capabilities_in_period,
       sanitizer_redactions: redactions,
+    },
+  });
+});
+
+// === GDPR DSAR (Data Subject Access Request) ===
+// POST /api/dsar/subject generates a per-subject audit report satisfying
+// GDPR Article 15 right-of-access. data_subject is auto-propagated from
+// a capability's compliance_justification onto every event emitted under
+// that capability (see emitEvent), so querying by data_subject yields
+// exactly the actions taken on behalf of that subject.
+// ─────────────────────────────────────────────────────────────
+
+type DsarReport = {
+  markdown: string;
+  capabilities_found: number;
+  events_found: number;
+  flags_found: number;
+  chain_status: string;
+  chain_head_event_id: number;
+  chain_head_hash: string;
+  total_chain_events: number;
+};
+
+function buildDsarReport(
+  subjectId: string,
+  startSec: number,
+  endSec: number
+): DsarReport {
+  const verify = verifyChainInternal();
+  const state = db.prepare("SELECT * FROM audit_chain_state WHERE id = 1").get() as
+    | { last_event_id: number; last_event_hash: string; genesis_hash: string; chain_started_at: number }
+    | undefined;
+  const genesisHash = state?.genesis_hash ?? "";
+  const startMs = startSec * 1000;
+  const endMs = endSec * 1000;
+
+  const caps = db
+    .prepare(
+      `SELECT c.*, r.task AS run_task, r.environment AS run_environment, r.agent_identity
+         FROM capabilities c
+         LEFT JOIN runs r ON r.id = c.run_id
+         WHERE json_extract(c.compliance_justification, '$.data_subject') = ?
+           AND c.granted_at >= ? AND c.granted_at <= ?
+         ORDER BY c.granted_at ASC`
+    )
+    .all(subjectId, startSec, endSec) as any[];
+
+  const events = db
+    .prepare(
+      `SELECT e.id, e.ts, e.run_id, e.capability_id, e.event_type, e.tool, e.outcome,
+              e.detail, e.duration_ms, e.args_redacted, e.compliance_tags, e.data_subject,
+              r.task AS run_task, r.environment AS run_environment
+         FROM events e
+         LEFT JOIN runs r ON r.id = e.run_id
+         WHERE e.data_subject = ?
+           AND e.ts >= ? AND e.ts <= ?
+         ORDER BY e.ts ASC`
+    )
+    .all(subjectId, startMs, endMs) as any[];
+
+  // Escape-hatch flags from runs that touched a capability tied to this subject.
+  const runIds = new Set<string>();
+  for (const c of caps) if (c.run_id) runIds.add(c.run_id);
+  for (const e of events) if (e.run_id) runIds.add(e.run_id);
+  let flags: any[] = [];
+  if (runIds.size > 0) {
+    const placeholders = Array.from(runIds).map(() => "?").join(",");
+    flags = db
+      .prepare(
+        `SELECT f.*, r.task AS run_task
+           FROM escape_hatch_flags f
+           LEFT JOIN runs r ON r.id = f.run_id
+          WHERE f.run_id IN (${placeholders})
+            AND f.raised_at >= ? AND f.raised_at <= ?
+          ORDER BY f.raised_at ASC`
+      )
+      .all(...Array.from(runIds), startSec, endSec) as any[];
+  }
+
+  // Summary aggregates
+  const frameworkSet = new Set<string>();
+  for (const c of caps) {
+    for (const t of parseTagsJson(c.compliance_tags)) frameworkSet.add(t);
+  }
+  const toolCalls = events.filter((e) => e.event_type === "tool_called");
+  const agentSet = new Set<string>();
+  let totalDuration = 0;
+  if (runIds.size > 0) {
+    const placeholders = Array.from(runIds).map(() => "?").join(",");
+    const runs = db
+      .prepare(
+        `SELECT id, agent_identity, started_at, ended_at
+           FROM runs WHERE id IN (${placeholders})`
+      )
+      .all(...Array.from(runIds)) as {
+      id: string;
+      agent_identity: string;
+      started_at: number;
+      ended_at: number | null;
+    }[];
+    for (const r of runs) {
+      if (r.agent_identity) agentSet.add(r.agent_identity);
+      if (r.ended_at && r.started_at) totalDuration += r.ended_at - r.started_at;
+    }
+  }
+
+  const lines: string[] = [];
+  lines.push(`# GDPR Article 15 Data Subject Access Request`);
+  lines.push(`Subject: ${mdEscape(subjectId)}`);
+  lines.push(`Generated: ${new Date().toISOString()}`);
+  lines.push(`Period: ${fmtTs(startSec, true)} to ${fmtTs(endSec, true)}`);
+  lines.push(`Warden Instance: ${genesisHash.slice(0, 16)}`);
+  lines.push(`Chain Status: ${chainStatusString(verify)}`);
+  lines.push("---");
+  lines.push("");
+
+  lines.push("## Summary");
+  lines.push(`- Capabilities granted involving this subject: ${caps.length}`);
+  lines.push(`- Actions taken on this subject's data: ${toolCalls.length}`);
+  lines.push(
+    `- Compliance frameworks invoked: ${frameworkSet.size ? Array.from(frameworkSet).join(", ") : "(none)"}`
+  );
+  lines.push(`- Flags raised on runs touching this subject: ${flags.length}`);
+  lines.push(`- Total duration of involved runs: ${totalDuration}s`);
+  lines.push(`- Unique agents involved: ${agentSet.size}`);
+  lines.push("");
+
+  lines.push("## Capabilities Granted");
+  if (caps.length === 0) {
+    lines.push("_No capabilities granted involving this subject in the period. (no activity)_");
+  } else {
+    lines.push(
+      "| Granted At | Run Task | Environment | Capability Type | Scope | TTL | Compliance Tags | Justification |"
+    );
+    lines.push("| --- | --- | --- | --- | --- | --- | --- | --- |");
+    for (const c of caps) {
+      const ttl = Math.max(0, (c.expires_at ?? 0) - (c.granted_at ?? 0));
+      const tags = parseTagsJson(c.compliance_tags);
+      const just = c.compliance_justification ?? c.justification;
+      lines.push(
+        `| ${fmtTs(c.granted_at, true)} | ${mdEscape(c.run_task ?? "—")} | ${mdEscape(
+          c.run_environment ?? "—"
+        )} | ${mdEscape(c.cap_type)} | ${mdEscape(c.scope)} | ${ttl}s | ${mdEscape(
+          tags.length ? tags.join(",") : "—"
+        )} | ${mdEscape(justificationInline(just))} |`
+      );
+    }
+  }
+  lines.push("");
+
+  lines.push("## Actions Taken");
+  if (toolCalls.length === 0) {
+    lines.push("_No actions taken on this subject's data in the period. (no activity)_");
+  } else {
+    lines.push("| Timestamp | Run Task | Tool | Outcome | Duration (ms) | Args (redacted) |");
+    lines.push("| --- | --- | --- | --- | --- | --- |");
+    for (const e of toolCalls) {
+      lines.push(
+        `| ${fmtTs(e.ts)} | ${mdEscape(e.run_task ?? "—")} | ${mdEscape(
+          e.tool ?? "—"
+        )} | ${e.outcome} | ${e.duration_ms ?? "—"} | ${mdEscape(
+          truncate(e.args_redacted ?? "—", 80)
+        )} |`
+      );
+    }
+  }
+  lines.push("");
+
+  lines.push("## Flags Raised");
+  if (flags.length === 0) {
+    lines.push("_No flags raised on runs touching this subject. (no activity)_");
+  } else {
+    lines.push("| Raised At | Rule | Level | Evidence Summary | Acknowledged |");
+    lines.push("| --- | --- | --- | --- | --- |");
+    for (const f of flags) {
+      let evSummary: string;
+      try {
+        const parsed = JSON.parse(f.evidence);
+        evSummary = truncate(JSON.stringify(parsed), 100);
+      } catch {
+        evSummary = truncate(String(f.evidence ?? ""), 100);
+      }
+      const acked = f.acknowledged_at ? fmtTs(f.acknowledged_at, true) : "—";
+      lines.push(
+        `| ${fmtTs(f.raised_at, true)} | ${f.rule_name} | ${f.level} | ${mdEscape(
+          evSummary
+        )} | ${acked} |`
+      );
+    }
+  }
+  lines.push("");
+
+  const headId = verify.valid ? verify.chain_head.event_id : state?.last_event_id ?? 0;
+  const headHash = verify.valid
+    ? verify.chain_head.event_hash
+    : state?.last_event_hash ?? "";
+  const totalChain = verify.valid ? verify.events_verified : 0;
+
+  lines.push("## Cryptographic Attestation");
+  lines.push(
+    `This report was generated on ${new Date().toISOString()} against a Warden audit chain of ${totalChain} events. ` +
+      `Chain verification at generation time: ${verify.valid ? "VALID" : "BROKEN"}. ` +
+      `The chain head at generation was event id ${headId}, hash ${headHash.slice(0, 16)}. ` +
+      `This report can be independently verified by re-running chain verification and confirming the same head state.`
+  );
+
+  return {
+    markdown: lines.join("\n") + "\n",
+    capabilities_found: caps.length,
+    events_found: events.length,
+    flags_found: flags.length,
+    chain_status: chainStatusString(verify),
+    chain_head_event_id: headId,
+    chain_head_hash: headHash,
+    total_chain_events: totalChain,
+  };
+}
+
+app.post("/api/dsar/subject", (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as {
+    subject_id?: unknown;
+    period_start?: unknown;
+    period_end?: unknown;
+    format?: unknown;
+  };
+  const subjectId = typeof body.subject_id === "string" ? body.subject_id.trim() : "";
+  if (!subjectId) {
+    return res.status(400).json({
+      error: "subject_id_required",
+      message: "subject_id must be a non-empty string",
+    });
+  }
+
+  const nowSecVal = nowSec();
+  const rawEnd = typeof body.period_end === "number" ? body.period_end : nowSecVal;
+  const rawStart = typeof body.period_start === "number" ? body.period_start : 0;
+  const normalize = (n: number) => (n > 10_000_000_000 ? Math.floor(n / 1000) : n);
+  const startSec = normalize(rawStart);
+  const endSec = normalize(rawEnd);
+
+  let built: DsarReport;
+  try {
+    built = buildDsarReport(subjectId, startSec, endSec);
+  } catch (err: any) {
+    console.error("[dsar] generation error", err);
+    return res.status(500).json({
+      error: "dsar_generation_failed",
+      message: String(err?.message ?? err),
+    });
+  }
+
+  // Defensive credential sanitizer over the markdown — same belt-and-suspenders
+  // pattern as /api/reports/generate. Honesty assertion should make this zero.
+  const { sanitized: sanitizedMarkdown } = sanitize(built.markdown);
+
+  res.setHeader("Content-Type", "application/json");
+  res.json({
+    request_id: randomUUID(),
+    subject_id: subjectId,
+    generated_at: nowSec(),
+    period: { start: startSec, end: endSec },
+    markdown: sanitizedMarkdown,
+    metadata: {
+      capabilities_found: built.capabilities_found,
+      events_found: built.events_found,
+      flags_found: built.flags_found,
+      chain_status: built.chain_status,
     },
   });
 });
