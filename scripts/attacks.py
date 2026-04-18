@@ -24,7 +24,7 @@ except ImportError:
     pass
 
 
-WARDEN_URL = os.environ.get("WARDEN_URL", "http://localhost:3000/mcp")
+WARDEN_URL = os.environ.get("WARDEN_URL", "http://localhost:3000/rpc")
 DEMO_REPO = os.environ.get("DEMO_REPO", "your-username/warden-demo")
 REAL_GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 
