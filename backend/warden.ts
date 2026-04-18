@@ -48,11 +48,12 @@ registerCredentialIfMissing("groq_prod", "groq", GROQ_API_KEY);
 
 // In-memory cache of credential values, used by sanitizer / leak detector / honesty assertion.
 let credentialValues: Set<string> = new Set();
+let credentialTypes: Map<string, string> = new Map();
 function reloadCredentialCache() {
-  const rows = db.prepare("SELECT value FROM credentials").all() as { value: string }[];
-  credentialValues = new Set(
-    rows.map((r) => r.value.trim()).filter((v) => v.length > 0)
-  );
+  const rows = db.prepare("SELECT value, type FROM credentials").all() as { value: string; type: string }[];
+  const trimmed = rows.map((r) => ({ value: r.value.trim(), type: r.type })).filter((r) => r.value.length > 0);
+  credentialValues = new Set(trimmed.map((r) => r.value));
+  credentialTypes = new Map(trimmed.map((r) => [r.value, r.type]));
 }
 reloadCredentialCache();
 
@@ -109,6 +110,8 @@ function detectLeak(args: any): { leaked: boolean; fields: string[] } {
     if (typeof node === "string") {
       for (const secret of secrets) {
         if (secret && node.includes(secret)) {
+          const credType = credentialTypes.get(secret) ?? "unknown";
+          console.log(`[detectLeak] field="${path}" preview="${node.slice(0, 20).replace(/\n/g, "\\n")}" type=${credType}`);
           fields.push(path);
           return;
         }
