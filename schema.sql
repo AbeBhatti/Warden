@@ -43,7 +43,17 @@ CREATE TABLE IF NOT EXISTS events (
   args_redacted TEXT,
   outcome TEXT NOT NULL,
   detail TEXT,
-  duration_ms INTEGER
+  duration_ms INTEGER,
+  prev_hash TEXT,
+  event_hash TEXT
+);
+
+CREATE TABLE IF NOT EXISTS audit_chain_state (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  last_event_id INTEGER NOT NULL,
+  last_event_hash TEXT NOT NULL,
+  genesis_hash TEXT NOT NULL,
+  chain_started_at INTEGER NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_run_ts ON events (run_id, ts);

@@ -1,7 +1,7 @@
 import express, { Request, Response } from "express";
 import cors from "cors";
 import Database from "better-sqlite3";
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -26,6 +26,22 @@ const GROQ_API_KEY = process.env.GROQ_API_KEY ?? "";
 const db = new Database(resolve(REPO_ROOT, "warden.db"));
 const schema = readFileSync(resolve(REPO_ROOT, "schema.sql"), "utf8");
 db.exec(schema);
+
+// Idempotent migrations for pre-existing DBs that predate the hash-chain columns.
+// schema.sql already declares these on fresh clones — this brings old DBs up to parity.
+{
+  const eventsCols = db.prepare("PRAGMA table_info(events)").all() as { name: string }[];
+  const colNames = new Set(eventsCols.map((c) => c.name));
+  if (!colNames.has("prev_hash")) db.exec("ALTER TABLE events ADD COLUMN prev_hash TEXT");
+  if (!colNames.has("event_hash")) db.exec("ALTER TABLE events ADD COLUMN event_hash TEXT");
+
+  const stateCount = db.prepare("SELECT COUNT(*) AS n FROM audit_chain_state").get() as { n: number };
+  if (stateCount.n === 0) {
+    db.prepare(
+      "INSERT INTO audit_chain_state (id, last_event_id, last_event_hash, genesis_hash, chain_started_at) VALUES (1, 0, 'GENESIS', ?, ?)"
+    ).run(randomBytes(32).toString("hex"), Math.floor(Date.now() / 1000));
+  }
+}
 
 // Register root credentials from .env if not already present
 const nowSec = () => Math.floor(Date.now() / 1000);
@@ -158,6 +174,51 @@ type EventRow = {
   duration_ms: number | null;
 };
 
+type ChainableEventRow = EventRow & { id: number; prev_hash: string };
+
+function computeEventHash(eventRow: ChainableEventRow, prevHash: string): string {
+  const canonical: Record<string, unknown> = {
+    id: eventRow.id,
+    ts: eventRow.ts,
+    run_id: eventRow.run_id ?? null,
+    capability_id: eventRow.capability_id ?? null,
+    event_type: eventRow.event_type,
+    tool: eventRow.tool ?? null,
+    args_redacted: eventRow.args_redacted ?? null,
+    outcome: eventRow.outcome,
+    detail: eventRow.detail ?? null,
+    duration_ms: eventRow.duration_ms ?? null,
+    prev_hash: prevHash,
+  };
+  const jsonString = JSON.stringify(canonical, Object.keys(canonical).sort());
+  return createHash("sha256").update(prevHash + "|" + jsonString).digest("hex");
+}
+
+const insertEventStmt = db.prepare(
+  `INSERT INTO events (ts, run_id, capability_id, event_type, tool, args_redacted, outcome, detail, duration_ms, prev_hash)
+   VALUES (@ts, @run_id, @capability_id, @event_type, @tool, @args_redacted, @outcome, @detail, @duration_ms, @prev_hash)`
+);
+const updateEventHashStmt = db.prepare("UPDATE events SET event_hash = ? WHERE id = ?");
+const readChainStateStmt = db.prepare("SELECT last_event_hash FROM audit_chain_state WHERE id = 1");
+const updateChainStateStmt = db.prepare(
+  "UPDATE audit_chain_state SET last_event_id = ?, last_event_hash = ? WHERE id = 1"
+);
+
+const emitEventTxn = db.transaction((row: EventRow): number => {
+  const state = readChainStateStmt.get() as { last_event_hash: string };
+  const prevHash = state.last_event_hash;
+
+  const info = insertEventStmt.run({ ...row, prev_hash: prevHash });
+  const id = Number(info.lastInsertRowid);
+
+  const chainable: ChainableEventRow = { ...row, id, prev_hash: prevHash };
+  const eventHash = computeEventHash(chainable, prevHash);
+
+  updateEventHashStmt.run(eventHash, id);
+  updateChainStateStmt.run(id, eventHash);
+  return id;
+});
+
 function emitEvent(e: Partial<EventRow> & Pick<EventRow, "event_type" | "outcome">): number {
   const row: EventRow = {
     ts: Date.now(),
@@ -173,13 +234,7 @@ function emitEvent(e: Partial<EventRow> & Pick<EventRow, "event_type" | "outcome
 
   assertNoRawCredentials(row);
 
-  const info = db
-    .prepare(
-      `INSERT INTO events (ts, run_id, capability_id, event_type, tool, args_redacted, outcome, detail, duration_ms)
-       VALUES (@ts, @run_id, @capability_id, @event_type, @tool, @args_redacted, @outcome, @detail, @duration_ms)`
-    )
-    .run(row);
-  return info.lastInsertRowid as number;
+  return emitEventTxn(row);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1301,6 +1356,97 @@ app.post("/api/revoke/:cap_id", (req: Request, res: Response) => {
 
 app.get("/api/health", (_req: Request, res: Response) => {
   res.json({ status: "ok", port: PORT });
+});
+
+// ─────────────────────────────────────────────────────────────
+// Audit chain endpoints
+// ─────────────────────────────────────────────────────────────
+
+app.get("/api/audit/chain_state", (_req: Request, res: Response) => {
+  const state = db.prepare("SELECT * FROM audit_chain_state WHERE id = 1").get() as
+    | {
+        id: number;
+        last_event_id: number;
+        last_event_hash: string;
+        genesis_hash: string;
+        chain_started_at: number;
+      }
+    | undefined;
+  const count = db.prepare("SELECT COUNT(*) AS n FROM events").get() as { n: number };
+  const chained = db
+    .prepare("SELECT COUNT(*) AS n FROM events WHERE event_hash IS NOT NULL")
+    .get() as { n: number };
+  res.json({
+    chain_state: state ?? null,
+    total_events: count.n,
+    chained_events: chained.n,
+  });
+});
+
+app.get("/api/audit/verify", (_req: Request, res: Response) => {
+  const rows = db
+    .prepare(
+      `SELECT id, ts, run_id, capability_id, event_type, tool, args_redacted, outcome, detail, duration_ms, prev_hash, event_hash
+         FROM events
+         WHERE event_hash IS NOT NULL
+         ORDER BY id ASC`
+    )
+    .all() as Array<
+    EventRow & { id: number; prev_hash: string | null; event_hash: string | null }
+  >;
+
+  const state = db.prepare("SELECT * FROM audit_chain_state WHERE id = 1").get() as
+    | { last_event_id: number; last_event_hash: string; genesis_hash: string; chain_started_at: number }
+    | undefined;
+
+  let expectedPrevHash = "GENESIS";
+  let verified = 0;
+  for (const row of rows) {
+    if (row.event_hash == null) {
+      return res.json({
+        valid: false,
+        break_at: row.id,
+        break_reason: "missing_hash",
+        events_verified: verified,
+      });
+    }
+    if ((row.prev_hash ?? "") !== expectedPrevHash) {
+      return res.json({
+        valid: false,
+        break_at: row.id,
+        break_reason: "prev_hash_mismatch",
+        events_verified: verified,
+      });
+    }
+    const recomputed = computeEventHash(
+      { ...(row as EventRow), id: row.id, prev_hash: expectedPrevHash },
+      expectedPrevHash
+    );
+    if (recomputed !== row.event_hash) {
+      return res.json({
+        valid: false,
+        break_at: row.id,
+        break_reason: "hash_mismatch",
+        events_verified: verified,
+      });
+    }
+    expectedPrevHash = row.event_hash;
+    verified++;
+  }
+
+  const head =
+    rows.length > 0
+      ? { event_id: rows[rows.length - 1].id, event_hash: rows[rows.length - 1].event_hash }
+      : { event_id: 0, event_hash: "GENESIS" };
+
+  res.json({
+    valid: true,
+    events_verified: verified,
+    chain_head: head,
+    chain_genesis: "GENESIS",
+    genesis_hash: state?.genesis_hash ?? null,
+    chain_started_at: state?.chain_started_at ?? null,
+  });
 });
 
 // ─────────────────────────────────────────────────────────────
