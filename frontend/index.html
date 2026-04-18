@@ -304,6 +304,27 @@ button{font-family:inherit;cursor:pointer}
         </table>
       </div>
 
+      <!-- audit chain -->
+      <div class="section" id="audit-section">
+        <div class="section-hdr" id="audit-hdr" style="cursor:pointer;user-select:none">
+          <span class="section-title">Audit Chain</span>
+          <span class="section-badge" id="audit-status" style="background:var(--card-b);color:var(--text2)">not yet verified</span>
+        </div>
+        <div id="audit-body" style="padding:12px 14px;display:none;flex-direction:column;gap:10px">
+          <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+            <button id="audit-verify-btn" class="action-btn" style="background:var(--blue-bg);color:var(--blue);border:1px solid var(--blue)">VERIFY NOW</button>
+            <span id="audit-verify-msg" class="text-muted" style="font-size:11px"></span>
+          </div>
+          <div style="display:grid;grid-template-columns:max-content 1fr;gap:4px 14px;font-size:11px">
+            <span class="text-muted">chain head id</span><span class="mono" id="audit-head-id">—</span>
+            <span class="text-muted">chain head hash</span><span class="mono" id="audit-head-hash" title="" style="color:var(--text2);overflow:hidden;text-overflow:ellipsis">—</span>
+            <span class="text-muted">events chained</span><span class="mono" id="audit-chained-count">0</span>
+            <span class="text-muted">genesis hash</span><span class="mono" id="audit-genesis-hash" title="" style="color:var(--muted);overflow:hidden;text-overflow:ellipsis">—</span>
+            <span class="text-muted">chain started</span><span class="mono text-muted" id="audit-started">—</span>
+          </div>
+        </div>
+      </div>
+
       <!-- credentials table -->
       <div class="section">
         <div class="section-hdr">
@@ -638,8 +659,70 @@ document.querySelectorAll(".sb-item").forEach(el=>{
   });
 });
 
+// ── audit chain panel ─────────────────────────────────────────────
+const $auditHdr        = document.getElementById("audit-hdr");
+const $auditBody       = document.getElementById("audit-body");
+const $auditStatus     = document.getElementById("audit-status");
+const $auditVerifyBtn  = document.getElementById("audit-verify-btn");
+const $auditVerifyMsg  = document.getElementById("audit-verify-msg");
+const $auditHeadId     = document.getElementById("audit-head-id");
+const $auditHeadHash   = document.getElementById("audit-head-hash");
+const $auditChained    = document.getElementById("audit-chained-count");
+const $auditGenesis    = document.getElementById("audit-genesis-hash");
+const $auditStarted    = document.getElementById("audit-started");
+
+function short(h){return h&&h.length>16?h.slice(0,16)+"…":(h||"—")}
+
+$auditHdr.addEventListener("click",()=>{
+  const open=$auditBody.style.display!=="none";
+  $auditBody.style.display=open?"none":"flex";
+});
+
+function setAuditStatus(kind,text){
+  $auditStatus.textContent=text;
+  if(kind==="valid"){$auditStatus.style.background="var(--green-bg)";$auditStatus.style.color="var(--green)"}
+  else if(kind==="broken"){$auditStatus.style.background="var(--red-bg)";$auditStatus.style.color="var(--red)"}
+  else{$auditStatus.style.background="var(--card-b)";$auditStatus.style.color="var(--text2)"}
+}
+
+async function pollChainState(){
+  try{
+    const d=await getJSON("/api/audit/chain_state");
+    const s=d.chain_state;
+    if(s){
+      $auditHeadId.textContent=String(s.last_event_id);
+      $auditHeadHash.textContent=short(s.last_event_hash);
+      $auditHeadHash.title=s.last_event_hash;
+      $auditGenesis.textContent=short(s.genesis_hash);
+      $auditGenesis.title=s.genesis_hash;
+      $auditStarted.textContent=fmtTimeSec(s.chain_started_at);
+    }
+    $auditChained.textContent=String(d.chained_events??0);
+  }catch{}
+  setTimeout(pollChainState,5000);
+}
+
+$auditVerifyBtn.addEventListener("click",async()=>{
+  $auditVerifyBtn.disabled=true;
+  $auditVerifyMsg.textContent="verifying…";
+  try{
+    const d=await getJSON("/api/audit/verify");
+    if(d.valid){
+      setAuditStatus("valid",`✓ chain verified (${d.events_verified} events)`);
+      $auditVerifyMsg.textContent=`verified ${d.events_verified} events at ${fmtTime(Date.now())}`;
+    }else{
+      setAuditStatus("broken",`✗ chain broken at event ${d.break_at}`);
+      $auditVerifyMsg.textContent=`break_at=${d.break_at}  reason=${d.break_reason}  (verified ${d.events_verified} before break)`;
+    }
+  }catch{
+    $auditVerifyMsg.textContent="verify failed (backend unreachable)";
+  }finally{
+    $auditVerifyBtn.disabled=false;
+  }
+});
+
 setConnected(false);
-pollRuns();pollEvents();pollCaps();pollCreds();
+pollRuns();pollEvents();pollCaps();pollCreds();pollChainState();
 setInterval(tickTTLs,1000);setInterval(tickUptime,1000);
 </script>
 </body>
