@@ -50,7 +50,8 @@ CREATE TABLE IF NOT EXISTS events (
   prev_hash TEXT,
   event_hash TEXT,
   compliance_tags TEXT,
-  hash_version INTEGER NOT NULL DEFAULT 1
+  hash_version INTEGER NOT NULL DEFAULT 1,
+  data_subject TEXT
 );
 
 CREATE TABLE IF NOT EXISTS audit_chain_state (
@@ -65,6 +66,9 @@ CREATE INDEX IF NOT EXISTS idx_events_run_ts ON events (run_id, ts);
 CREATE INDEX IF NOT EXISTS idx_events_type ON events (event_type);
 CREATE INDEX IF NOT EXISTS idx_caps_run ON capabilities (run_id);
 CREATE INDEX IF NOT EXISTS idx_caps_active ON capabilities (revoked_at, expires_at);
+-- Note: idx_events_data_subject is created by the data_subject migration block
+-- in backend/warden.ts startup, which runs AFTER schema.sql. Pre-DSAR DBs
+-- don't have the column yet when schema.sql is executed.
 
 CREATE TABLE IF NOT EXISTS policies (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

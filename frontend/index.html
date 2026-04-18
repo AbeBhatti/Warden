@@ -422,6 +422,39 @@ button{font-family:inherit;cursor:pointer}
         </div>
       </div>
 
+      <!-- GDPR DSAR queries -->
+      <div class="section" id="dsar-section">
+        <div class="section-hdr" id="dsar-hdr" style="cursor:pointer;user-select:none">
+          <span class="section-title">GDPR DSAR Queries</span>
+          <span class="section-badge" id="dsar-badge" style="background:var(--card-b);color:var(--text2)">click to open</span>
+        </div>
+        <div id="dsar-body" style="padding:12px 14px;display:none;flex-direction:column;gap:12px">
+          <div class="text-muted" style="font-size:10.5px">Satisfies GDPR Article 15 right-of-access requirements. Report lists all agent actions involving the specified data subject, cryptographically verified against Warden's tamper-evident audit chain.</div>
+          <div style="display:grid;grid-template-columns:max-content 1fr;gap:8px 14px;align-items:center;font-size:11px">
+            <span class="text-muted">Subject ID</span>
+            <input id="dsar-subject" type="text" placeholder="e.g. user_42" style="background:var(--main);color:var(--text2);border:1px solid var(--card-b);border-radius:4px;padding:6px 8px;font-size:11px;font-family:inherit;min-width:260px"/>
+            <span class="text-muted">Period start</span>
+            <input id="dsar-start" type="datetime-local" style="background:var(--main);color:var(--text2);border:1px solid var(--card-b);border-radius:4px;padding:6px 8px;font-size:11px;font-family:inherit"/>
+            <span class="text-muted">Period end</span>
+            <input id="dsar-end" type="datetime-local" style="background:var(--main);color:var(--text2);border:1px solid var(--card-b);border-radius:4px;padding:6px 8px;font-size:11px;font-family:inherit"/>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+            <button id="dsar-generate-btn" class="action-btn" style="background:var(--blue-bg);color:var(--blue);border:1px solid var(--blue)">GENERATE DSAR REPORT</button>
+            <button id="dsar-copy-btn" class="action-btn" style="background:var(--card-b);color:var(--text2);border:1px solid var(--card-b);display:none">COPY TO CLIPBOARD</button>
+            <button id="dsar-download-btn" class="action-btn" style="background:var(--card-b);color:var(--text2);border:1px solid var(--card-b);display:none">DOWNLOAD .md</button>
+            <span id="dsar-status" class="text-muted" style="font-size:11px"></span>
+          </div>
+          <div id="dsar-meta" style="display:none;grid-template-columns:max-content 1fr;gap:4px 14px;font-size:11px;background:var(--main);border:1px solid var(--card-b);border-radius:6px;padding:10px 12px">
+            <span class="text-muted">request id</span><span class="mono" id="dsar-meta-id">—</span>
+            <span class="text-muted">generated at</span><span class="mono" id="dsar-meta-ts">—</span>
+            <span class="text-muted">chain status</span><span class="mono" id="dsar-meta-chain">—</span>
+            <span class="text-muted">capabilities found</span><span class="mono" id="dsar-meta-caps">—</span>
+            <span class="text-muted">events found</span><span class="mono" id="dsar-meta-events">—</span>
+          </div>
+          <pre id="dsar-markdown" class="mono" style="display:none;background:#1a1a1a;border:1px solid var(--card-b);border-radius:6px;padding:14px 16px;font-size:11.5px;color:#d4d4d4;max-height:600px;overflow:auto;white-space:pre-wrap;line-height:1.55"></pre>
+        </div>
+      </div>
+
       <!-- active policy -->
       <div class="section" id="policy-section">
         <div class="section-hdr" id="policy-hdr" style="cursor:pointer;user-select:none">
@@ -1214,6 +1247,110 @@ $reportsDlBtn.addEventListener("click",()=>{
 
 defaultReportsRange();
 loadReportTypes();
+
+// ── GDPR DSAR queries ──────────────────────────────────────────
+const $dsarHdr        = document.getElementById("dsar-hdr");
+const $dsarBody       = document.getElementById("dsar-body");
+const $dsarSubject    = document.getElementById("dsar-subject");
+const $dsarStart      = document.getElementById("dsar-start");
+const $dsarEnd        = document.getElementById("dsar-end");
+const $dsarGenBtn     = document.getElementById("dsar-generate-btn");
+const $dsarCopyBtn    = document.getElementById("dsar-copy-btn");
+const $dsarDlBtn      = document.getElementById("dsar-download-btn");
+const $dsarStatus     = document.getElementById("dsar-status");
+const $dsarMeta       = document.getElementById("dsar-meta");
+const $dsarMetaId     = document.getElementById("dsar-meta-id");
+const $dsarMetaTs     = document.getElementById("dsar-meta-ts");
+const $dsarMetaChain  = document.getElementById("dsar-meta-chain");
+const $dsarMetaCaps   = document.getElementById("dsar-meta-caps");
+const $dsarMetaEvents = document.getElementById("dsar-meta-events");
+const $dsarMd         = document.getElementById("dsar-markdown");
+
+let dsarLastMarkdown="", dsarLastSubject="", dsarLastTs=0;
+
+$dsarHdr.addEventListener("click",()=>{
+  const open=$dsarBody.style.display!=="none";
+  $dsarBody.style.display=open?"none":"flex";
+});
+
+function defaultDsarRange(){
+  const now=new Date(),start=new Date(now.getTime()-365*24*3600*1000);
+  $dsarStart.value=toLocalInputValue(start);
+  $dsarEnd.value=toLocalInputValue(now);
+}
+
+$dsarGenBtn.addEventListener("click",async()=>{
+  const subjectId=$dsarSubject.value.trim();
+  if(!subjectId){
+    $dsarStatus.textContent="subject_id required";
+    return;
+  }
+  const start=toEpochSec($dsarStart.value);
+  const end=toEpochSec($dsarEnd.value);
+  const body={subject_id:subjectId,format:"markdown"};
+  if(start!=null)body.period_start=start;
+  if(end!=null)body.period_end=end;
+  $dsarStatus.textContent="generating…";
+  $dsarGenBtn.disabled=true;
+  try{
+    const r=await fetch(`${API_BASE}/api/dsar/subject`,{
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify(body)
+    });
+    const j=await r.json();
+    if(!r.ok){
+      $dsarStatus.textContent=`error: ${j.error||"unknown"} — ${j.message||""}`;
+      $dsarMd.style.display="none";
+      $dsarMeta.style.display="none";
+      $dsarCopyBtn.style.display="none";
+      $dsarDlBtn.style.display="none";
+      return;
+    }
+    dsarLastMarkdown=j.markdown||"";
+    dsarLastSubject=j.subject_id||subjectId;
+    dsarLastTs=j.generated_at||Math.floor(Date.now()/1000);
+    $dsarMd.textContent=dsarLastMarkdown;
+    $dsarMd.style.display="block";
+    $dsarMeta.style.display="grid";
+    $dsarMetaId.textContent=j.request_id||"—";
+    $dsarMetaTs.textContent=new Date(dsarLastTs*1000).toISOString();
+    $dsarMetaChain.textContent=(j.metadata&&j.metadata.chain_status)||"—";
+    $dsarMetaCaps.textContent=(j.metadata&&j.metadata.capabilities_found)??"—";
+    $dsarMetaEvents.textContent=(j.metadata&&j.metadata.events_found)??"—";
+    $dsarCopyBtn.style.display="inline-block";
+    $dsarDlBtn.style.display="inline-block";
+    $dsarStatus.textContent=`generated ${new Date().toLocaleTimeString()}`;
+  }catch(e){
+    $dsarStatus.textContent="request failed — backend unreachable";
+  }finally{
+    $dsarGenBtn.disabled=false;
+  }
+});
+
+$dsarCopyBtn.addEventListener("click",async()=>{
+  if(!dsarLastMarkdown)return;
+  try{
+    await navigator.clipboard.writeText(dsarLastMarkdown);
+    $dsarStatus.textContent="copied to clipboard";
+  }catch{
+    $dsarStatus.textContent="clipboard blocked";
+  }
+});
+
+$dsarDlBtn.addEventListener("click",()=>{
+  if(!dsarLastMarkdown)return;
+  const ts=new Date((dsarLastTs||Math.floor(Date.now()/1000))*1000).toISOString().replace(/[:.]/g,"-");
+  const safeSubject=(dsarLastSubject||"subject").replace(/[^a-zA-Z0-9_-]/g,"_");
+  const fname=`warden-dsar-${safeSubject}-${ts}.md`;
+  const blob=new Blob([dsarLastMarkdown],{type:"text/markdown"});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement("a");
+  a.href=url;a.download=fname;document.body.appendChild(a);a.click();
+  setTimeout(()=>{URL.revokeObjectURL(url);a.remove();},0);
+});
+
+defaultDsarRange();
 
 setConnected(false);
 pollRuns();pollEvents();pollCaps();pollCreds();pollChainState();loadPolicy();pollFlags();
