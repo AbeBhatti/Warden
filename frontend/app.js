@@ -116,6 +116,16 @@ async function pollEvents() {
   try {
     const data = await getJSON(`/api/events?since=${state.lastEventId}&limit=${EVENTS_LIMIT}`);
     setConnected(true);
+    // Backend-restart detection: if the DB's max id is below our cursor, the
+    // events table was reseeded (fresh start / DB wipe). Reset so the next
+    // poll fetches from 0 instead of silently stalling behind a stale cursor.
+    if (data && typeof data.latest_id === "number" && data.latest_id < state.lastEventId) {
+      console.info("Warden dashboard: backend restart detected (latest_id=" + data.latest_id + " < cursor=" + state.lastEventId + "); resetting event state");
+      state.events = [];
+      state.openEventIds.clear();
+      state.lastEventId = 0;
+      renderEvents();
+    }
     if (data && Array.isArray(data.events) && data.events.length) {
       for (const ev of data.events) {
         state.events.unshift(ev);
