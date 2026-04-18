@@ -6,6 +6,9 @@ import { readFileSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import dotenv from "dotenv";
+import { z } from "zod";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "..");
@@ -795,10 +798,208 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
-app.post("/mcp", async (req: Request, res: Response) => {
+// Legacy JSON-RPC compatibility route for Python demo agent + attack harness.
+// Real MCP clients should use /mcp (Streamable HTTP transport, wired below).
+app.post("/rpc", async (req: Request, res: Response) => {
   const resp = await dispatchRpc(req.body);
   res.json(resp);
 });
+
+// ─────────────────────────────────────────────────────────────
+// MCP server — real protocol via StreamableHTTPServerTransport
+// Routes every tools/call through the same underlying handlers the
+// legacy /rpc dispatcher uses, so the security pipeline is shared.
+// ─────────────────────────────────────────────────────────────
+
+function buildMcpServer(): McpServer {
+  const srv = new McpServer(
+    { name: "warden", version: "0.1.0" },
+    {
+      capabilities: { tools: {} },
+      instructions:
+        "Warden brokers credentials for external services. Agents never hold raw tokens — " +
+        "they hold opaque handles minted per run. Start every session with warden.start_run, " +
+        "request access via warden.request_* tools to get a handle, call warden.<service>.<op> " +
+        "using the handle, and call warden.end_run when done to auto-revoke all handles.",
+    }
+  );
+  registerWardenTools(srv);
+  return srv;
+}
+
+// Map tool-name → underlying function. Handlers are defined already; we route to them.
+const toolImpl: Record<string, (params: any) => any | Promise<any>> = METHODS;
+
+function wrapOk(result: any) {
+  return { content: [{ type: "text" as const, text: JSON.stringify(result) }] };
+}
+function wrapErr(err: any) {
+  const text =
+    err instanceof RpcError
+      ? JSON.stringify({
+          error: true,
+          code: err.data?.code ?? err.code,
+          message: err.message,
+          data: err.data,
+        })
+      : JSON.stringify({ error: true, code: -32603, message: String(err?.message ?? err) });
+  return { content: [{ type: "text" as const, text }], isError: true };
+}
+
+async function runTool(name: string, args: Record<string, unknown>) {
+  const impl = toolImpl[name];
+  if (!impl) return wrapErr(new RpcError(-32601, `Method not found: ${name}`));
+  try {
+    const result = await impl(args);
+    return wrapOk(result);
+  } catch (err) {
+    return wrapErr(err);
+  }
+}
+
+// Zod shapes for each tool. Match the existing params shapes the underlying fns accept.
+const startRunShape = { task: z.string().describe("Human-readable description of what this run will do.") };
+
+const endRunShape = { run_id: z.string().describe("The run_id returned by warden.start_run.") };
+
+const githubAccessShape = {
+  run_id: z.string(),
+  scope: z.object({
+    repo: z.string().describe("GitHub repository as 'owner/repo'."),
+    permissions: z.array(z.enum(["read", "write"])),
+  }),
+  justification: z.string().describe("Reason the agent needs this access (logged in audit trail)."),
+  ttl_seconds: z.number().int().positive().max(3600).optional(),
+};
+
+const groqAccessShape = {
+  run_id: z.string(),
+  scope: z.object({
+    models: z.array(z.string()),
+    max_tokens_per_call: z.number().int().positive().max(4096).optional(),
+  }),
+  justification: z.string(),
+  ttl_seconds: z.number().int().positive().max(3600).optional(),
+};
+
+const listIssuesShape = {
+  handle: z.string().describe("Capability handle (cap_*) from warden.request_github_access."),
+  repo: z.string(),
+  state: z.enum(["open", "closed", "all"]).optional(),
+};
+
+const createCommentShape = {
+  handle: z.string(),
+  repo: z.string(),
+  issue_number: z.number().int().positive(),
+  body: z.string().describe("Comment body. Must not contain any raw credential values — Warden blocks with LEAK_DETECTED."),
+};
+
+const chatCompletionShape = {
+  handle: z.string(),
+  messages: z.array(
+    z.object({
+      role: z.enum(["system", "user", "assistant"]),
+      content: z.string(),
+    })
+  ),
+  model: z.string().optional(),
+  max_tokens: z.number().int().positive().optional(),
+};
+
+function registerWardenTools(srv: McpServer): void {
+  srv.registerTool(
+    "warden.start_run",
+    {
+      description:
+        "Begin a new Warden run. Call this first in every session. Returns a run_id that tags all subsequent capability requests and events. The run must be ended with warden.end_run (or it will auto-expire after 1 hour).",
+      inputSchema: startRunShape,
+    },
+    async (args) => runTool("warden.start_run", args)
+  );
+
+  srv.registerTool(
+    "warden.end_run",
+    {
+      description:
+        "End a Warden run. Auto-revokes all capabilities minted during the run. After this call, every handle from this run becomes unusable.",
+      inputSchema: endRunShape,
+    },
+    async (args) => runTool("warden.end_run", args)
+  );
+
+  srv.registerTool(
+    "warden.request_github_access",
+    {
+      description:
+        "Request a scoped, time-limited GitHub capability for the current run. Returns an opaque handle (cap_*) — NOT a GitHub token. Use the handle with warden.github.list_issues and warden.github.create_comment.",
+      inputSchema: githubAccessShape,
+    },
+    async (args) => runTool("warden.request_github_access", args)
+  );
+
+  srv.registerTool(
+    "warden.request_groq_access",
+    {
+      description:
+        "Request a scoped, time-limited Groq (OpenAI-compatible LLM) capability for the current run. Returns an opaque handle (cap_*) — NOT the Groq API key. Use with warden.groq.chat_completion.",
+      inputSchema: groqAccessShape,
+    },
+    async (args) => runTool("warden.request_groq_access", args)
+  );
+
+  srv.registerTool(
+    "warden.github.list_issues",
+    {
+      description:
+        "List issues on a GitHub repository. Warden makes the call on your behalf using the credential behind the handle — you never see the raw token. Repo must match the scope granted to the handle.",
+      inputSchema: listIssuesShape,
+    },
+    async (args) => runTool("warden.github.list_issues", args)
+  );
+
+  srv.registerTool(
+    "warden.github.create_comment",
+    {
+      description:
+        "Post a comment on a GitHub issue through Warden. IMPORTANT: do NOT include any raw API tokens or secrets in the body — Warden's leak detector will block the call with LEAK_DETECTED if it sees a known credential value. Write permission required on the handle.",
+      inputSchema: createCommentShape,
+    },
+    async (args) => runTool("warden.github.create_comment", args)
+  );
+
+  srv.registerTool(
+    "warden.groq.chat_completion",
+    {
+      description:
+        "Call Groq chat completions (OpenAI-compatible) through Warden. IMPORTANT: do NOT include any raw credentials in the messages — Warden blocks the call with LEAK_DETECTED before any request leaves the process. Model must be in the handle's granted scope.",
+      inputSchema: chatCompletionShape,
+    },
+    async (args) => runTool("warden.groq.chat_completion", args)
+  );
+}
+
+// Stateless Streamable HTTP: each request gets a fresh server+transport pair
+// (SDK requirement when sessionIdGenerator is undefined).
+async function handleMcp(req: Request, res: Response) {
+  const server = buildMcpServer();
+  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+  res.on("close", () => {
+    transport.close().catch(() => {});
+    server.close().catch(() => {});
+  });
+  try {
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (err) {
+    console.error("MCP handleRequest error:", err);
+    if (!res.headersSent) res.status(500).json({ error: "mcp_transport_error" });
+  }
+}
+
+app.post("/mcp", handleMcp);
+app.get("/mcp", handleMcp);
+app.delete("/mcp", handleMcp);
 
 // Dashboard endpoints
 app.get("/api/events", (req: Request, res: Response) => {
