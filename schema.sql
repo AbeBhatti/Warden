@@ -73,3 +73,23 @@ CREATE TABLE IF NOT EXISTS policies (
   active INTEGER NOT NULL,
   created_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS escape_hatch_flags (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  rule_name TEXT NOT NULL,
+  level TEXT NOT NULL,
+  evidence TEXT NOT NULL,
+  raised_at INTEGER NOT NULL,
+  acknowledged_at INTEGER,
+  acknowledged_by TEXT,
+  acknowledge_note TEXT,
+  FOREIGN KEY (run_id) REFERENCES runs(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ehf_unack
+  ON escape_hatch_flags (acknowledged_at, raised_at);
+CREATE INDEX IF NOT EXISTS idx_ehf_run
+  ON escape_hatch_flags (run_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ehf_dedup
+  ON escape_hatch_flags (run_id, rule_name);

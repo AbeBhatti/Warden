@@ -63,6 +63,28 @@ db.exec(schema);
       "INSERT INTO audit_chain_state (id, last_event_id, last_event_hash, genesis_hash, chain_started_at) VALUES (1, 0, 'GENESIS', ?, ?)"
     ).run(randomBytes(32).toString("hex"), Math.floor(Date.now() / 1000));
   }
+
+  // escape_hatch_flags — idempotent; schema.sql creates on fresh clones, this covers older DBs.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS escape_hatch_flags (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      rule_name TEXT NOT NULL,
+      level TEXT NOT NULL,
+      evidence TEXT NOT NULL,
+      raised_at INTEGER NOT NULL,
+      acknowledged_at INTEGER,
+      acknowledged_by TEXT,
+      acknowledge_note TEXT,
+      FOREIGN KEY (run_id) REFERENCES runs(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_ehf_unack
+      ON escape_hatch_flags (acknowledged_at, raised_at);
+    CREATE INDEX IF NOT EXISTS idx_ehf_run
+      ON escape_hatch_flags (run_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_ehf_dedup
+      ON escape_hatch_flags (run_id, rule_name);
+  `);
 }
 
 // Register root credentials from .env if not already present
@@ -741,6 +763,8 @@ function endRun(params: any, reason: "run_ended" | "timeout" = "run_ended") {
       outcome: "ok",
       detail: `reason=${reason}`,
     });
+    // Rule 1 hook: fire UNUSED_CAPABILITY if nothing ever used this cap.
+    evaluateUnusedCapability(c.id);
   }
 
   emitEvent({
@@ -1125,6 +1149,8 @@ function openPipeline(
     db.prepare(
       "UPDATE capabilities SET revoked_at = ?, revocation_reason = 'expired' WHERE id = ?"
     ).run(nowSec(), cap.id);
+    // Rule 1 hook: fire UNUSED_CAPABILITY if the cap expired without any tool_called.
+    evaluateUnusedCapability(cap.id);
     emitEvent({
       run_id: cap.run_id,
       capability_id: cap.id,
@@ -1950,6 +1976,8 @@ app.post("/api/revoke/:cap_id", (req: Request, res: Response) => {
     outcome: "ok",
     detail: "reason=manual",
   });
+  // Rule 1 hook: fire UNUSED_CAPABILITY if the cap was revoked without any tool_called.
+  evaluateUnusedCapability(cap_id);
   res.json({ cap_id, revoked_at: ts, status: "ok" });
 });
 
@@ -1959,6 +1987,85 @@ app.get("/api/health", (_req: Request, res: Response) => {
 
 app.get("/api/policy", (_req: Request, res: Response) => {
   res.json({ source: policyConfigSource, config: policyConfig });
+});
+
+// ─────────────────────────────────────────────────────────────
+// Escape-hatch flag endpoints
+// ─────────────────────────────────────────────────────────────
+
+function parseEvidenceJson(s: string): unknown {
+  try { return JSON.parse(s); } catch { return s; }
+}
+
+app.get("/api/flags", (req: Request, res: Response) => {
+  const status = String(req.query.status ?? "active");
+  const where = status === "all" ? "" : "WHERE f.acknowledged_at IS NULL";
+  const rows = db
+    .prepare(
+      `SELECT f.id, f.run_id, f.rule_name, f.level, f.evidence,
+              f.raised_at, f.acknowledged_at, f.acknowledged_by, f.acknowledge_note,
+              r.task AS run_task, r.environment AS run_environment
+         FROM escape_hatch_flags f
+         LEFT JOIN runs r ON r.id = f.run_id
+         ${where}
+         ORDER BY f.raised_at DESC
+         LIMIT 100`
+    )
+    .all() as any[];
+  const flags = rows.map((r) => ({
+    ...r,
+    evidence: parseEvidenceJson(r.evidence),
+  }));
+  res.json({ flags });
+});
+
+app.post("/api/flags/:id/acknowledge", (req: Request, res: Response) => {
+  const id = req.params.id;
+  const note = typeof req.body?.note === "string" ? req.body.note : null;
+  const existing = db
+    .prepare("SELECT id, run_id, rule_name, acknowledged_at FROM escape_hatch_flags WHERE id = ?")
+    .get(id) as
+    | { id: string; run_id: string; rule_name: string; acknowledged_at: number | null }
+    | undefined;
+  if (!existing) return res.status(404).json({ status: "not_found" });
+  if (existing.acknowledged_at != null) {
+    return res.status(409).json({
+      status: "already_acknowledged",
+      id,
+      acknowledged_at: existing.acknowledged_at,
+    });
+  }
+  const ts = nowSec();
+  db.prepare(
+    "UPDATE escape_hatch_flags SET acknowledged_at = ?, acknowledged_by = 'operator', acknowledge_note = ? WHERE id = ?"
+  ).run(ts, note, id);
+  emitEvent({
+    run_id: existing.run_id,
+    event_type: "escape_hatch_acknowledged",
+    outcome: "ok",
+    detail: `flag_id=${id} rule=${existing.rule_name}`,
+  });
+  res.json({ id, acknowledged_at: ts });
+});
+
+app.get("/api/flags/run/:run_id", (req: Request, res: Response) => {
+  const run_id = req.params.run_id;
+  const rows = db
+    .prepare(
+      `SELECT f.id, f.run_id, f.rule_name, f.level, f.evidence,
+              f.raised_at, f.acknowledged_at, f.acknowledged_by, f.acknowledge_note,
+              r.task AS run_task, r.environment AS run_environment
+         FROM escape_hatch_flags f
+         LEFT JOIN runs r ON r.id = f.run_id
+        WHERE f.run_id = ?
+        ORDER BY f.raised_at DESC`
+    )
+    .all(run_id) as any[];
+  const flags = rows.map((r) => ({
+    ...r,
+    evidence: parseEvidenceJson(r.evidence),
+  }));
+  res.json({ flags });
 });
 
 // ─────────────────────────────────────────────────────────────
@@ -2059,6 +2166,245 @@ app.get("/api/audit/verify", (_req: Request, res: Response) => {
   });
 });
 
+// === ESCAPE HATCH DETECTION ===
+// Surfaces agents attempting to work around Warden: unused capabilities,
+// scope-escalation probes, denial bursts, leak bursts, unusual call rates.
+// Each rule fires at most once per (run_id, rule_name) thanks to the UNIQUE
+// index on escape_hatch_flags — re-evaluation is safe.
+// ─────────────────────────────────────────────────────────────
+
+type EscapeHatchRuleName =
+  | "UNUSED_CAPABILITY"
+  | "DUPLICATE_CAPABILITY_REQUEST"
+  | "SCOPE_ESCALATION_PROBE"
+  | "HIGH_DENIAL_RATE"
+  | "LEAK_ATTEMPT_BURST"
+  | "UNUSUAL_CALL_RATE";
+
+type EscapeHatchLevel = "low" | "medium" | "high";
+
+const insertFlagStmt = db.prepare(
+  `INSERT OR IGNORE INTO escape_hatch_flags
+     (id, run_id, rule_name, level, evidence, raised_at)
+   VALUES (?, ?, ?, ?, ?, ?)`
+);
+
+/** Insert a flag and, if genuinely new, emit an escape_hatch_flagged event.
+ * Returns true if a new flag was written, false if dedup swallowed it. */
+function raiseFlag(
+  run_id: string,
+  rule_name: EscapeHatchRuleName,
+  level: EscapeHatchLevel,
+  evidence: Record<string, unknown>
+): boolean {
+  const id = "ehf_" + randomBytes(8).toString("hex");
+  const evidenceJson = JSON.stringify(evidence);
+  const info = insertFlagStmt.run(id, run_id, rule_name, level, evidenceJson, nowSec());
+  if (info.changes === 0) return false; // dedup hit — another fire already recorded
+  emitEvent({
+    run_id,
+    event_type: "escape_hatch_flagged",
+    outcome: "blocked",
+    detail: `rule=${rule_name} level=${level} flag_id=${id} evidence=${evidenceJson}`,
+  });
+  console.log(`[escape-hatch] fired rule=${rule_name} level=${level} run_id=${run_id} flag_id=${id}`);
+  return true;
+}
+
+// ——— Rule 1: UNUSED_CAPABILITY (event-driven; hooked in revocation path) ———
+function evaluateUnusedCapability(cap_id: string): void {
+  const cap = db
+    .prepare(
+      `SELECT id, run_id, cap_type, granted_at, revoked_at, revocation_reason
+         FROM capabilities WHERE id = ?`
+    )
+    .get(cap_id) as
+    | {
+        id: string;
+        run_id: string;
+        cap_type: string;
+        granted_at: number;
+        revoked_at: number | null;
+        revocation_reason: string | null;
+      }
+    | undefined;
+  if (!cap || cap.revoked_at == null) return;
+
+  const usage = db
+    .prepare(
+      "SELECT COUNT(*) AS n FROM events WHERE capability_id = ? AND event_type = 'tool_called'"
+    )
+    .get(cap_id) as { n: number };
+  if (usage.n > 0) return;
+
+  raiseFlag(cap.run_id, "UNUSED_CAPABILITY", "low", {
+    cap_id: cap.id,
+    cap_type: cap.cap_type,
+    run_id: cap.run_id,
+    granted_at: cap.granted_at,
+    revoked_at: cap.revoked_at,
+    revoked_reason: cap.revocation_reason,
+    tool_calls_observed: 0,
+  });
+}
+
+// ——— Rule 2: DUPLICATE_CAPABILITY_REQUEST ———
+function evaluateDuplicateRequest(run_id: string): void {
+  const cutoff = nowSec() - 30;
+  const rows = db
+    .prepare(
+      `SELECT cap_type, COUNT(*) AS c,
+              MIN(granted_at) AS first_granted_at,
+              MAX(granted_at) AS latest_granted_at
+         FROM capabilities
+        WHERE run_id = ? AND granted_at > ?
+        GROUP BY cap_type
+       HAVING c >= 2`
+    )
+    .all(run_id, cutoff) as {
+    cap_type: string;
+    c: number;
+    first_granted_at: number;
+    latest_granted_at: number;
+  }[];
+  for (const r of rows) {
+    raiseFlag(run_id, "DUPLICATE_CAPABILITY_REQUEST", "medium", {
+      cap_type: r.cap_type,
+      count: r.c,
+      first_granted_at: r.first_granted_at,
+      latest_granted_at: r.latest_granted_at,
+      window_seconds: 30,
+    });
+  }
+}
+
+// ——— Rule 3: SCOPE_ESCALATION_PROBE ———
+function extractPermissions(scopeJson: string, cap_type: string): string[] {
+  try {
+    const s = JSON.parse(scopeJson);
+    if (cap_type === "github" && Array.isArray(s?.permissions)) return s.permissions.map(String);
+    if (cap_type === "groq" && Array.isArray(s?.models)) return s.models.map(String);
+  } catch {}
+  return [];
+}
+function evaluateScopeEscalation(run_id: string): void {
+  const caps = db
+    .prepare(
+      `SELECT cap_type, scope, granted_at
+         FROM capabilities
+        WHERE run_id = ?
+        ORDER BY granted_at ASC`
+    )
+    .all(run_id) as { cap_type: string; scope: string; granted_at: number }[];
+  const byType = new Map<string, { perms: Set<string>; granted_at: number }[]>();
+  for (const c of caps) {
+    const perms = new Set(extractPermissions(c.scope, c.cap_type));
+    const list = byType.get(c.cap_type) ?? [];
+    list.push({ perms, granted_at: c.granted_at });
+    byType.set(c.cap_type, list);
+  }
+  for (const [cap_type, list] of byType) {
+    for (let i = 0; i + 1 < list.length; i++) {
+      const a = list[i], b = list[i + 1];
+      const delta = b.granted_at - a.granted_at;
+      if (delta > 60) continue;
+      // strict superset: every perm of a is in b, and b has at least one extra
+      let aSubsetOfB = true;
+      for (const p of a.perms) if (!b.perms.has(p)) { aSubsetOfB = false; break; }
+      if (!aSubsetOfB) continue;
+      if (b.perms.size <= a.perms.size) continue;
+      raiseFlag(run_id, "SCOPE_ESCALATION_PROBE", "medium", {
+        cap_type,
+        first_scope: [...a.perms],
+        escalated_scope: [...b.perms],
+        time_delta_seconds: delta,
+      });
+      break; // one fire per run handles the superset trend
+    }
+  }
+}
+
+// ——— Rule 4: HIGH_DENIAL_RATE ———
+function evaluateHighDenial(run_id: string): void {
+  const row = db
+    .prepare(
+      `SELECT
+         SUM(CASE WHEN event_type='capability_denied' THEN 1 ELSE 0 END) AS denied,
+         SUM(CASE WHEN event_type='capability_granted' THEN 1 ELSE 0 END) AS granted
+       FROM events WHERE run_id = ?`
+    )
+    .get(run_id) as { denied: number | null; granted: number | null };
+  const denied = row.denied ?? 0;
+  const granted = row.granted ?? 0;
+  if (denied < 2) return;
+  if (denied <= granted) return;
+  raiseFlag(run_id, "HIGH_DENIAL_RATE", "high", {
+    denied_count: denied,
+    granted_count: granted,
+    ratio: granted === 0 ? null : denied / granted,
+  });
+}
+
+// ——— Rule 5: LEAK_ATTEMPT_BURST ———
+function evaluateLeakBurst(run_id: string): void {
+  const cutoffMs = Date.now() - 60_000;
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS n, MIN(ts) AS first_ts, MAX(ts) AS latest_ts
+         FROM events
+        WHERE run_id = ? AND event_type = 'leak_detected' AND ts > ?`
+    )
+    .get(run_id, cutoffMs) as { n: number; first_ts: number | null; latest_ts: number | null };
+  if (row.n < 2) return;
+  raiseFlag(run_id, "LEAK_ATTEMPT_BURST", "high", {
+    leak_detected_count: row.n,
+    first_leak_ts: row.first_ts,
+    latest_leak_ts: row.latest_ts,
+    window_seconds: 60,
+  });
+}
+
+// ——— Rule 6: UNUSUAL_CALL_RATE ———
+function evaluateUnusualCallRate(run_id: string): void {
+  const cutoffMs = Date.now() - 60_000;
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM events
+        WHERE run_id = ? AND event_type = 'tool_called' AND ts > ?`
+    )
+    .get(run_id, cutoffMs) as { n: number };
+  if (row.n <= 20) return;
+  raiseFlag(run_id, "UNUSUAL_CALL_RATE", "medium", {
+    tool_calls_in_window: row.n,
+    window_seconds: 60,
+  });
+}
+
+function evaluateBackgroundRules(): void {
+  const active = db.prepare("SELECT id FROM runs WHERE status = 'active'").all() as { id: string }[];
+  for (const r of active) {
+    try {
+      evaluateDuplicateRequest(r.id);
+      evaluateScopeEscalation(r.id);
+      evaluateHighDenial(r.id);
+      evaluateLeakBurst(r.id);
+      evaluateUnusualCallRate(r.id);
+    } catch (err) {
+      console.error("[escape-hatch] rule evaluation error", r.id, err);
+    }
+  }
+}
+
+// Guard against double-setup if the module were re-imported. On tsx-watch
+// restart Node itself restarts, so the handle vanishes with the process.
+declare global {
+  // eslint-disable-next-line no-var
+  var __wardenEscapeHatchInterval: NodeJS.Timeout | undefined;
+}
+if (!globalThis.__wardenEscapeHatchInterval) {
+  globalThis.__wardenEscapeHatchInterval = setInterval(evaluateBackgroundRules, 30_000);
+}
+
 // ─────────────────────────────────────────────────────────────
 // Timeout sweep — auto-end runs older than 1 hour
 // ─────────────────────────────────────────────────────────────
@@ -2076,7 +2422,13 @@ function sweepTimeouts() {
     }
   }
 }
-setInterval(sweepTimeouts, 30_000);
+declare global {
+  // eslint-disable-next-line no-var
+  var __wardenSweepInterval: NodeJS.Timeout | undefined;
+}
+if (!globalThis.__wardenSweepInterval) {
+  globalThis.__wardenSweepInterval = setInterval(sweepTimeouts, 30_000);
+}
 
 // ─────────────────────────────────────────────────────────────
 // Startup
