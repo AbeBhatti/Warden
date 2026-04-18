@@ -387,6 +387,41 @@ button{font-family:inherit;cursor:pointer}
         </table>
       </div>
 
+      <!-- compliance reports -->
+      <div class="section" id="reports-section">
+        <div class="section-hdr" id="reports-hdr" style="cursor:pointer;user-select:none">
+          <span class="section-title">Compliance Reports</span>
+          <span class="section-badge" id="reports-badge" style="background:var(--card-b);color:var(--text2)">click to open</span>
+        </div>
+        <div id="reports-body" style="padding:12px 14px;display:none;flex-direction:column;gap:12px">
+          <div style="display:grid;grid-template-columns:max-content 1fr;gap:8px 14px;align-items:center;font-size:11px">
+            <span class="text-muted">Report type</span>
+            <select id="reports-type" style="background:var(--main);color:var(--text2);border:1px solid var(--card-b);border-radius:4px;padding:6px 8px;font-size:11px;min-width:260px"></select>
+            <span class="text-muted">Period start</span>
+            <input id="reports-start" type="datetime-local" style="background:var(--main);color:var(--text2);border:1px solid var(--card-b);border-radius:4px;padding:6px 8px;font-size:11px;font-family:inherit"/>
+            <span class="text-muted">Period end</span>
+            <input id="reports-end" type="datetime-local" style="background:var(--main);color:var(--text2);border:1px solid var(--card-b);border-radius:4px;padding:6px 8px;font-size:11px;font-family:inherit"/>
+            <span class="text-muted" id="reports-fw-label" style="display:none">Framework</span>
+            <select id="reports-framework" style="display:none;background:var(--main);color:var(--text2);border:1px solid var(--card-b);border-radius:4px;padding:6px 8px;font-size:11px;min-width:160px"></select>
+          </div>
+          <div id="reports-description" class="text-muted" style="font-size:10.5px"></div>
+          <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+            <button id="reports-generate-btn" class="action-btn" style="background:var(--blue-bg);color:var(--blue);border:1px solid var(--blue)">GENERATE REPORT</button>
+            <button id="reports-copy-btn" class="action-btn" style="background:var(--card-b);color:var(--text2);border:1px solid var(--card-b);display:none">COPY TO CLIPBOARD</button>
+            <button id="reports-download-btn" class="action-btn" style="background:var(--card-b);color:var(--text2);border:1px solid var(--card-b);display:none">DOWNLOAD .md</button>
+            <span id="reports-status" class="text-muted" style="font-size:11px"></span>
+          </div>
+          <div id="reports-meta" style="display:none;grid-template-columns:max-content 1fr;gap:4px 14px;font-size:11px;background:var(--main);border:1px solid var(--card-b);border-radius:6px;padding:10px 12px">
+            <span class="text-muted">report id</span><span class="mono" id="reports-meta-id">—</span>
+            <span class="text-muted">generated at</span><span class="mono" id="reports-meta-ts">—</span>
+            <span class="text-muted">chain status</span><span class="mono" id="reports-meta-chain">—</span>
+            <span class="text-muted">events scanned</span><span class="mono" id="reports-meta-scanned">—</span>
+            <span class="text-muted">sanitizer redactions</span><span class="mono" id="reports-meta-redactions">—</span>
+          </div>
+          <pre id="reports-markdown" class="mono" style="display:none;background:#1a1a1a;border:1px solid var(--card-b);border-radius:6px;padding:14px 16px;font-size:11.5px;color:#d4d4d4;max-height:600px;overflow:auto;white-space:pre-wrap;line-height:1.55"></pre>
+        </div>
+      </div>
+
       <!-- active policy -->
       <div class="section" id="policy-section">
         <div class="section-hdr" id="policy-hdr" style="cursor:pointer;user-select:none">
@@ -1032,6 +1067,153 @@ async function pollFlags(){
   }catch{}
   setTimeout(pollFlags,2000);
 }
+
+// ── compliance reports panel ──────────────────────────────────────
+const $reportsHdr        = document.getElementById("reports-hdr");
+const $reportsBody       = document.getElementById("reports-body");
+const $reportsBadge      = document.getElementById("reports-badge");
+const $reportsType       = document.getElementById("reports-type");
+const $reportsStart      = document.getElementById("reports-start");
+const $reportsEnd        = document.getElementById("reports-end");
+const $reportsFw         = document.getElementById("reports-framework");
+const $reportsFwLabel    = document.getElementById("reports-fw-label");
+const $reportsDesc       = document.getElementById("reports-description");
+const $reportsGenBtn     = document.getElementById("reports-generate-btn");
+const $reportsCopyBtn    = document.getElementById("reports-copy-btn");
+const $reportsDlBtn      = document.getElementById("reports-download-btn");
+const $reportsStatus     = document.getElementById("reports-status");
+const $reportsMeta       = document.getElementById("reports-meta");
+const $reportsMetaId     = document.getElementById("reports-meta-id");
+const $reportsMetaTs     = document.getElementById("reports-meta-ts");
+const $reportsMetaChain  = document.getElementById("reports-meta-chain");
+const $reportsMetaScanned= document.getElementById("reports-meta-scanned");
+const $reportsMetaRed    = document.getElementById("reports-meta-redactions");
+const $reportsMd         = document.getElementById("reports-markdown");
+
+let reportsLastMarkdown="", reportsLastType="", reportsLastTs=0;
+let reportsTypesCache=[];
+
+$reportsHdr.addEventListener("click",()=>{
+  const open=$reportsBody.style.display!=="none";
+  $reportsBody.style.display=open?"none":"flex";
+});
+
+function toLocalInputValue(d){
+  const pad=n=>String(n).padStart(2,"0");
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+function defaultReportsRange(){
+  const now=new Date(),start=new Date(now.getTime()-24*3600*1000);
+  $reportsStart.value=toLocalInputValue(start);
+  $reportsEnd.value=toLocalInputValue(now);
+}
+
+function updateReportsDescription(){
+  const id=$reportsType.value;
+  const def=reportsTypesCache.find(r=>r.id===id);
+  $reportsDesc.textContent=def?def.description:"";
+  const isFw=id==="FRAMEWORK_SPECIFIC";
+  $reportsFw.style.display=isFw?"inline-block":"none";
+  $reportsFwLabel.style.display=isFw?"inline-block":"none";
+}
+
+async function loadReportTypes(){
+  try{
+    const d=await getJSON("/api/reports/types");
+    reportsTypesCache=d.reports||[];
+    $reportsType.innerHTML=reportsTypesCache
+      .map(r=>`<option value="${r.id}">${r.name}</option>`).join("");
+    // Populate framework dropdown from /api/policy frameworks
+    try{
+      const p=await getJSON("/api/policy");
+      const frameworks=p?.config?.compliance_frameworks||{};
+      $reportsFw.innerHTML=Object.keys(frameworks)
+        .map(k=>`<option value="${k}">${k}</option>`).join("");
+    }catch{}
+    updateReportsDescription();
+  }catch{
+    $reportsStatus.textContent="failed to load report types";
+  }
+}
+
+$reportsType.addEventListener("change",updateReportsDescription);
+
+function toEpochSec(localStr){
+  if(!localStr)return null;
+  const d=new Date(localStr);
+  if(isNaN(d.getTime()))return null;
+  return Math.floor(d.getTime()/1000);
+}
+
+$reportsGenBtn.addEventListener("click",async()=>{
+  const reportType=$reportsType.value;
+  const start=toEpochSec($reportsStart.value);
+  const end=toEpochSec($reportsEnd.value);
+  const body={report_type:reportType};
+  if(start!=null)body.period_start=start;
+  if(end!=null)body.period_end=end;
+  if(reportType==="FRAMEWORK_SPECIFIC")body.framework=$reportsFw.value;
+  $reportsStatus.textContent="generating…";
+  $reportsGenBtn.disabled=true;
+  try{
+    const r=await fetch(`${API_BASE}/api/reports/generate`,{
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify(body)
+    });
+    const j=await r.json();
+    if(!r.ok){
+      $reportsStatus.textContent=`error: ${j.error||"unknown"} — ${j.message||""}`;
+      $reportsMd.style.display="none";
+      $reportsMeta.style.display="none";
+      $reportsCopyBtn.style.display="none";
+      $reportsDlBtn.style.display="none";
+      return;
+    }
+    reportsLastMarkdown=j.markdown||"";
+    reportsLastType=j.report_type||reportType;
+    reportsLastTs=j.generated_at||Math.floor(Date.now()/1000);
+    $reportsMd.textContent=reportsLastMarkdown;
+    $reportsMd.style.display="block";
+    $reportsMeta.style.display="grid";
+    $reportsMetaId.textContent=j.report_id||"—";
+    $reportsMetaTs.textContent=new Date(reportsLastTs*1000).toISOString();
+    $reportsMetaChain.textContent=(j.metadata&&j.metadata.chain_status)||"—";
+    $reportsMetaScanned.textContent=(j.metadata&&j.metadata.events_scanned)??"—";
+    $reportsMetaRed.textContent=(j.metadata&&j.metadata.sanitizer_redactions)??"—";
+    $reportsCopyBtn.style.display="inline-block";
+    $reportsDlBtn.style.display="inline-block";
+    $reportsStatus.textContent=`generated ${new Date().toLocaleTimeString()}`;
+  }catch(e){
+    $reportsStatus.textContent="request failed — backend unreachable";
+  }finally{
+    $reportsGenBtn.disabled=false;
+  }
+});
+
+$reportsCopyBtn.addEventListener("click",async()=>{
+  if(!reportsLastMarkdown)return;
+  try{
+    await navigator.clipboard.writeText(reportsLastMarkdown);
+    $reportsStatus.textContent="copied to clipboard";
+  }catch{
+    $reportsStatus.textContent="clipboard blocked";
+  }
+});
+
+$reportsDlBtn.addEventListener("click",()=>{
+  if(!reportsLastMarkdown)return;
+  const ts=new Date((reportsLastTs||Math.floor(Date.now()/1000))*1000).toISOString().replace(/[:.]/g,"-");
+  const fname=`warden-${reportsLastType}-${ts}.md`;
+  const blob=new Blob([reportsLastMarkdown],{type:"text/markdown"});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement("a");
+  a.href=url;a.download=fname;document.body.appendChild(a);a.click();
+  setTimeout(()=>{URL.revokeObjectURL(url);a.remove();},0);
+});
+
+defaultReportsRange();
+loadReportTypes();
 
 setConnected(false);
 pollRuns();pollEvents();pollCaps();pollCreds();pollChainState();loadPolicy();pollFlags();

@@ -2405,6 +2405,902 @@ if (!globalThis.__wardenEscapeHatchInterval) {
   globalThis.__wardenEscapeHatchInterval = setInterval(evaluateBackgroundRules, 30_000);
 }
 
+// === COMPLIANCE REPORTS ===
+// Step 1 intentionally no-op; reports are read-only over existing schema.
+// Six canonical reports produce auditor-ready markdown artifacts:
+//   ACCESS_SUMMARY, DENIED_ACCESS_SUMMARY, ESCAPE_HATCH_AUDIT,
+//   HONESTY_AUDIT, FRAMEWORK_SPECIFIC, RETENTION_COMPLIANCE.
+// No new event types are emitted; the hash chain is untouched.
+// ─────────────────────────────────────────────────────────────
+
+type ReportType =
+  | "ACCESS_SUMMARY"
+  | "DENIED_ACCESS_SUMMARY"
+  | "ESCAPE_HATCH_AUDIT"
+  | "HONESTY_AUDIT"
+  | "FRAMEWORK_SPECIFIC"
+  | "RETENTION_COMPLIANCE";
+
+const REPORT_DEFS: {
+  id: ReportType;
+  name: string;
+  description: string;
+  required_params: string[];
+  optional_params: string[];
+}[] = [
+  {
+    id: "ACCESS_SUMMARY",
+    name: "Access Summary",
+    description:
+      "Capabilities granted in the period — by framework, environment, agent. Use for periodic access review.",
+    required_params: [],
+    optional_params: ["period_start", "period_end", "framework"],
+  },
+  {
+    id: "DENIED_ACCESS_SUMMARY",
+    name: "Denied Access Summary",
+    description:
+      "Blocked capability requests, tool calls, and leak detections in the period.",
+    required_params: [],
+    optional_params: ["period_start", "period_end"],
+  },
+  {
+    id: "ESCAPE_HATCH_AUDIT",
+    name: "Escape-Hatch Audit",
+    description:
+      "Flags raised by escape-hatch detectors, grouped by level and acknowledgement status.",
+    required_params: [],
+    optional_params: ["period_start", "period_end"],
+  },
+  {
+    id: "HONESTY_AUDIT",
+    name: "Honesty Audit",
+    description:
+      "Hash-chain integrity, assertion coverage, sampled recomputation, and raw-credential scan.",
+    required_params: [],
+    optional_params: ["period_start", "period_end"],
+  },
+  {
+    id: "FRAMEWORK_SPECIFIC",
+    name: "Framework-Specific Report",
+    description:
+      "Activity scoped to a compliance framework (HIPAA / PCI / SOX / GDPR).",
+    required_params: ["framework"],
+    optional_params: ["period_start", "period_end"],
+  },
+  {
+    id: "RETENTION_COMPLIANCE",
+    name: "Retention Compliance Check",
+    description:
+      "Events older than each framework's audit_retention_days that still exist in the DB.",
+    required_params: [],
+    optional_params: ["period_start", "period_end"],
+  },
+];
+
+const REPORT_TYPE_SET = new Set<ReportType>(REPORT_DEFS.map((r) => r.id));
+
+function parseTagsJson(s: string | null | undefined): string[] {
+  if (!s) return [];
+  try {
+    const v = JSON.parse(s);
+    if (Array.isArray(v)) return v.map((x) => String(x));
+    return [];
+  } catch {
+    return [];
+  }
+}
+
+function getGenesisHash(): string {
+  const row = db.prepare("SELECT genesis_hash FROM audit_chain_state WHERE id = 1").get() as
+    | { genesis_hash: string }
+    | undefined;
+  return row?.genesis_hash ?? "";
+}
+
+type ChainVerificationResult =
+  | {
+      valid: true;
+      events_verified: number;
+      chain_head: { event_id: number; event_hash: string };
+      genesis_hash: string | null;
+      chain_started_at: number | null;
+    }
+  | {
+      valid: false;
+      break_at: number;
+      break_reason: "missing_hash" | "prev_hash_mismatch" | "hash_mismatch";
+      events_verified: number;
+    };
+
+function verifyChainInternal(): ChainVerificationResult {
+  const rows = db
+    .prepare(
+      `SELECT id, ts, run_id, capability_id, event_type, tool, args_redacted, outcome, detail, duration_ms, prev_hash, event_hash, compliance_tags, hash_version
+         FROM events
+         WHERE event_hash IS NOT NULL
+         ORDER BY id ASC`
+    )
+    .all() as Array<
+    EventRow & {
+      id: number;
+      prev_hash: string | null;
+      event_hash: string | null;
+      hash_version: number | null;
+    }
+  >;
+  const state = db.prepare("SELECT * FROM audit_chain_state WHERE id = 1").get() as
+    | { genesis_hash: string; chain_started_at: number }
+    | undefined;
+
+  let expectedPrevHash = "GENESIS";
+  let verified = 0;
+  for (const row of rows) {
+    if (row.event_hash == null) {
+      return { valid: false, break_at: row.id, break_reason: "missing_hash", events_verified: verified };
+    }
+    if ((row.prev_hash ?? "") !== expectedPrevHash) {
+      return { valid: false, break_at: row.id, break_reason: "prev_hash_mismatch", events_verified: verified };
+    }
+    const ver = row.hash_version ?? 1;
+    const recomputed = computeEventHashVersioned(
+      { ...(row as EventRow), id: row.id, prev_hash: expectedPrevHash },
+      expectedPrevHash,
+      ver
+    );
+    if (recomputed !== row.event_hash) {
+      return { valid: false, break_at: row.id, break_reason: "hash_mismatch", events_verified: verified };
+    }
+    expectedPrevHash = row.event_hash;
+    verified++;
+  }
+  const head =
+    rows.length > 0
+      ? { event_id: rows[rows.length - 1].id, event_hash: rows[rows.length - 1].event_hash as string }
+      : { event_id: 0, event_hash: "GENESIS" };
+  return {
+    valid: true,
+    events_verified: verified,
+    chain_head: head,
+    genesis_hash: state?.genesis_hash ?? null,
+    chain_started_at: state?.chain_started_at ?? null,
+  };
+}
+
+function chainStatusString(v: ChainVerificationResult): string {
+  return v.valid ? "valid" : `broken_at_${v.break_at}`;
+}
+
+function truncate(s: string, n: number): string {
+  if (s.length <= n) return s;
+  return s.slice(0, n) + "...";
+}
+
+function fmtTs(msOrSec: number, fromSeconds = false): string {
+  const ms = fromSeconds ? msOrSec * 1000 : msOrSec;
+  if (!Number.isFinite(ms) || ms <= 0) return "—";
+  return new Date(ms).toISOString();
+}
+
+function justificationInline(raw: string | null): string {
+  if (!raw) return "—";
+  const s = raw.trim();
+  try {
+    const parsed = JSON.parse(s);
+    if (parsed && typeof parsed === "object") {
+      const compact = JSON.stringify(parsed);
+      return truncate(compact, 80);
+    }
+  } catch {
+    /* fall through to string */
+  }
+  return truncate(s, 80);
+}
+
+function mdEscape(s: string | null | undefined): string {
+  if (s == null) return "";
+  return String(s).replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
+}
+
+function formatHeader(
+  title: string,
+  startSec: number,
+  endSec: number,
+  verify: ChainVerificationResult,
+  genesisHash: string
+): string {
+  const header = [
+    `# ${title}`,
+    `Generated: ${new Date().toISOString()}`,
+    `Period: ${fmtTs(startSec, true)} to ${fmtTs(endSec, true)}`,
+    `Warden Instance: ${genesisHash.slice(0, 16)}`,
+    `Chain Status: ${chainStatusString(verify)}`,
+    "---",
+    "",
+  ];
+  return header.join("\n");
+}
+
+// ——— Report 1: ACCESS_SUMMARY ———
+function reportAccessSummary(opts: { startSec: number; endSec: number; framework?: string }): {
+  markdown: string;
+  events_scanned: number;
+  total_capabilities_in_period: number;
+} {
+  const { startSec, endSec, framework } = opts;
+  const verify = verifyChainInternal();
+  const genesisHash = getGenesisHash();
+
+  const caps = db
+    .prepare(
+      `SELECT c.*, r.task AS run_task, r.environment AS run_environment, r.agent_identity
+         FROM capabilities c
+         LEFT JOIN runs r ON r.id = c.run_id
+         WHERE c.granted_at >= ? AND c.granted_at <= ?
+         ORDER BY c.granted_at DESC`
+    )
+    .all(startSec, endSec) as any[];
+
+  const filtered = framework
+    ? caps.filter((c) => parseTagsJson(c.compliance_tags).includes(framework))
+    : caps;
+
+  const byFramework = { HIPAA: 0, PCI: 0, SOX: 0, GDPR: 0, Untagged: 0 } as Record<string, number>;
+  const byEnv: Record<string, number> = {};
+  const runSet = new Set<string>();
+  const agentSet = new Set<string>();
+  for (const c of filtered) {
+    const tags = parseTagsJson(c.compliance_tags);
+    if (tags.length === 0) byFramework.Untagged++;
+    for (const t of tags) byFramework[t] = (byFramework[t] ?? 0) + 1;
+    const env = c.run_environment ?? "unknown";
+    byEnv[env] = (byEnv[env] ?? 0) + 1;
+    if (c.run_id) runSet.add(c.run_id);
+    if (c.agent_identity) agentSet.add(c.agent_identity);
+  }
+
+  const lines: string[] = [];
+  lines.push(formatHeader("Access Summary", startSec, endSec, verify, genesisHash));
+  if (framework) lines.push(`Framework filter: **${framework}**\n`);
+  lines.push("## Summary");
+  lines.push(`- Total capabilities granted: ${filtered.length}`);
+  lines.push(
+    `- By compliance framework: HIPAA (${byFramework.HIPAA}), PCI (${byFramework.PCI}), SOX (${byFramework.SOX}), GDPR (${byFramework.GDPR}), Untagged (${byFramework.Untagged})`
+  );
+  const envParts = Object.keys(byEnv).length
+    ? Object.entries(byEnv).map(([k, v]) => `${k} (${v})`).join(", ")
+    : "(none)";
+  lines.push(`- By environment: ${envParts}`);
+  lines.push(`- Unique runs: ${runSet.size}`);
+  lines.push(`- Unique agents: ${agentSet.size}`);
+  lines.push("");
+  lines.push("## Capabilities (newest first)");
+  if (filtered.length === 0) {
+    lines.push("_No capabilities granted in this period._");
+  } else {
+    lines.push(
+      "| Run Task | Environment | Capability | Scope | TTL | Granted At | Compliance Tags | Justification |"
+    );
+    lines.push("| --- | --- | --- | --- | --- | --- | --- | --- |");
+    for (const c of filtered) {
+      const ttl = Math.max(0, (c.expires_at ?? 0) - (c.granted_at ?? 0));
+      const tags = parseTagsJson(c.compliance_tags);
+      const just = c.compliance_justification ?? c.justification;
+      lines.push(
+        `| ${mdEscape(c.run_task ?? "—")} | ${mdEscape(c.run_environment ?? "—")} | ${mdEscape(
+          c.cap_type
+        )} | ${mdEscape(c.scope)} | ${ttl}s | ${fmtTs(c.granted_at, true)} | ${mdEscape(
+          tags.length ? tags.join(",") : "—"
+        )} | ${mdEscape(justificationInline(just))} |`
+      );
+    }
+  }
+
+  return {
+    markdown: lines.join("\n") + "\n",
+    events_scanned: 0,
+    total_capabilities_in_period: filtered.length,
+  };
+}
+
+// ——— Report 2: DENIED_ACCESS_SUMMARY ———
+function reportDeniedAccessSummary(opts: { startSec: number; endSec: number }): {
+  markdown: string;
+  events_scanned: number;
+  total_capabilities_in_period: number;
+} {
+  const { startSec, endSec } = opts;
+  const verify = verifyChainInternal();
+  const genesisHash = getGenesisHash();
+
+  const startMs = startSec * 1000;
+  const endMs = endSec * 1000;
+
+  const rows = db
+    .prepare(
+      `SELECT e.id, e.ts, e.run_id, e.event_type, e.tool, e.detail, r.task AS run_task
+         FROM events e
+         LEFT JOIN runs r ON r.id = e.run_id
+         WHERE e.event_type IN ('capability_denied','tool_blocked','leak_detected')
+           AND e.ts >= ? AND e.ts <= ?
+         ORDER BY e.ts DESC`
+    )
+    .all(startMs, endMs) as any[];
+
+  const byType: Record<string, number> = {
+    capability_denied: 0,
+    tool_blocked: 0,
+    leak_detected: 0,
+  };
+  const byRun: Record<string, number> = {};
+  for (const r of rows) {
+    byType[r.event_type] = (byType[r.event_type] ?? 0) + 1;
+    if (r.run_id) byRun[r.run_id] = (byRun[r.run_id] ?? 0) + 1;
+  }
+
+  const lines: string[] = [];
+  lines.push(formatHeader("Denied Access Summary", startSec, endSec, verify, genesisHash));
+  lines.push("## Summary");
+  lines.push(`- Total denials: ${rows.length}`);
+  lines.push(
+    `- By type: capability_denied (${byType.capability_denied}), tool_blocked (${byType.tool_blocked}), leak_detected (${byType.leak_detected})`
+  );
+  if (Object.keys(byRun).length === 0) {
+    lines.push("- By run: (none)");
+  } else {
+    lines.push("- By run:");
+    for (const [rid, count] of Object.entries(byRun).sort((a, b) => b[1] - a[1])) {
+      lines.push(`  - \`${rid}\`: ${count}`);
+    }
+  }
+  lines.push("");
+  lines.push("## Denials");
+  if (rows.length === 0) {
+    lines.push("_No denials in this period._");
+  } else {
+    lines.push("| Timestamp | Run Task | Event Type | Tool | Detail |");
+    lines.push("| --- | --- | --- | --- | --- |");
+    for (const r of rows) {
+      lines.push(
+        `| ${fmtTs(r.ts)} | ${mdEscape(r.run_task ?? "—")} | ${r.event_type} | ${mdEscape(
+          r.tool ?? "—"
+        )} | ${mdEscape(truncate(r.detail ?? "—", 120))} |`
+      );
+    }
+  }
+
+  return { markdown: lines.join("\n") + "\n", events_scanned: rows.length, total_capabilities_in_period: 0 };
+}
+
+// ——— Report 3: ESCAPE_HATCH_AUDIT ———
+function reportEscapeHatchAudit(opts: { startSec: number; endSec: number }): {
+  markdown: string;
+  events_scanned: number;
+  total_capabilities_in_period: number;
+} {
+  const { startSec, endSec } = opts;
+  const verify = verifyChainInternal();
+  const genesisHash = getGenesisHash();
+
+  const flags = db
+    .prepare(
+      `SELECT f.*, r.task AS run_task
+         FROM escape_hatch_flags f
+         LEFT JOIN runs r ON r.id = f.run_id
+         WHERE f.raised_at >= ? AND f.raised_at <= ?
+         ORDER BY f.raised_at DESC`
+    )
+    .all(startSec, endSec) as any[];
+
+  const byLevel: Record<string, number> = { high: 0, medium: 0, low: 0 };
+  let ack = 0;
+  for (const f of flags) {
+    byLevel[f.level] = (byLevel[f.level] ?? 0) + 1;
+    if (f.acknowledged_at != null) ack++;
+  }
+
+  const lines: string[] = [];
+  lines.push(formatHeader("Escape-Hatch Audit", startSec, endSec, verify, genesisHash));
+  lines.push("## Summary");
+  lines.push(`- Total flags: ${flags.length}`);
+  lines.push(
+    `- By level: high (${byLevel.high}), medium (${byLevel.medium}), low (${byLevel.low})`
+  );
+  lines.push(`- Acknowledged: ${ack} / ${flags.length}`);
+  lines.push(`- Unacknowledged: ${flags.length - ack} / ${flags.length}`);
+  lines.push("");
+  lines.push("## Flags (newest first)");
+  if (flags.length === 0) {
+    lines.push("_No flags raised in this period._");
+  } else {
+    lines.push("| Raised At | Run Task | Rule | Level | Evidence (summary) | Acknowledged | Note |");
+    lines.push("| --- | --- | --- | --- | --- | --- | --- |");
+    for (const f of flags) {
+      let evSummary: string;
+      try {
+        const parsed = JSON.parse(f.evidence);
+        evSummary = truncate(JSON.stringify(parsed), 100);
+      } catch {
+        evSummary = truncate(String(f.evidence ?? ""), 100);
+      }
+      const acked = f.acknowledged_at ? fmtTs(f.acknowledged_at, true) : "—";
+      lines.push(
+        `| ${fmtTs(f.raised_at, true)} | ${mdEscape(f.run_task ?? "—")} | ${f.rule_name} | ${f.level} | ${mdEscape(
+          evSummary
+        )} | ${acked} | ${mdEscape(f.acknowledge_note ?? "—")} |`
+      );
+    }
+  }
+
+  return { markdown: lines.join("\n") + "\n", events_scanned: 0, total_capabilities_in_period: 0 };
+}
+
+// ——— Report 4: HONESTY_AUDIT ———
+function reportHonestyAudit(opts: { startSec: number; endSec: number }): {
+  markdown: string;
+  events_scanned: number;
+  total_capabilities_in_period: number;
+} {
+  const { startSec, endSec } = opts;
+  const verify = verifyChainInternal();
+  const state = db.prepare("SELECT * FROM audit_chain_state WHERE id = 1").get() as
+    | { genesis_hash: string; chain_started_at: number; last_event_id: number; last_event_hash: string }
+    | undefined;
+  const genesisHash = state?.genesis_hash ?? "";
+
+  const startMs = startSec * 1000;
+  const endMs = endSec * 1000;
+
+  const totalInPeriod = db
+    .prepare("SELECT COUNT(*) AS n FROM events WHERE ts >= ? AND ts <= ?")
+    .get(startMs, endMs) as { n: number };
+  const excluded = db
+    .prepare(
+      "SELECT COUNT(*) AS n FROM events WHERE ts >= ? AND ts <= ? AND (hash_version IS NULL OR event_hash IS NULL)"
+    )
+    .get(startMs, endMs) as { n: number };
+  const v1Count = db
+    .prepare(
+      "SELECT COUNT(*) AS n FROM events WHERE ts >= ? AND ts <= ? AND hash_version = 1 AND event_hash IS NOT NULL"
+    )
+    .get(startMs, endMs) as { n: number };
+  const v2Count = db
+    .prepare(
+      "SELECT COUNT(*) AS n FROM events WHERE ts >= ? AND ts <= ? AND hash_version = 2 AND event_hash IS NOT NULL"
+    )
+    .get(startMs, endMs) as { n: number };
+
+  // Sampled integrity check: up to 20 random chained events in the period.
+  const sample = db
+    .prepare(
+      `SELECT id, ts, run_id, capability_id, event_type, tool, args_redacted, outcome, detail,
+              duration_ms, prev_hash, event_hash, compliance_tags, hash_version
+         FROM events
+        WHERE event_hash IS NOT NULL AND ts >= ? AND ts <= ?
+        ORDER BY RANDOM()
+        LIMIT 20`
+    )
+    .all(startMs, endMs) as Array<
+    EventRow & { id: number; prev_hash: string | null; event_hash: string; hash_version: number | null }
+  >;
+
+  let samplePass = 0;
+  let sampleFail = 0;
+  const sampleFailures: number[] = [];
+  for (const row of sample) {
+    const prev = row.prev_hash ?? "";
+    const ver = row.hash_version ?? 1;
+    const recomputed = computeEventHashVersioned(
+      { ...(row as EventRow), id: row.id, prev_hash: prev },
+      prev,
+      ver
+    );
+    if (recomputed === row.event_hash) samplePass++;
+    else {
+      sampleFail++;
+      sampleFailures.push(row.id);
+    }
+  }
+
+  // Raw-credential scan: for each credential value, look for it in events in period.
+  // If the honesty assertion is firing, this MUST return zero hits.
+  const creds = db.prepare("SELECT id, type, value FROM credentials").all() as {
+    id: string;
+    type: string;
+    value: string;
+  }[];
+  const credentialHits: { credential_id: string; event_ids: number[] }[] = [];
+  for (const c of creds) {
+    const v = (c.value ?? "").trim();
+    if (!v) continue;
+    const hits = db
+      .prepare(
+        `SELECT id FROM events
+           WHERE ts >= ? AND ts <= ?
+             AND (instr(IFNULL(args_redacted,''), ?) > 0
+               OR instr(IFNULL(detail,''), ?) > 0
+               OR instr(IFNULL(tool,''), ?) > 0
+               OR instr(IFNULL(event_type,''), ?) > 0)`
+      )
+      .all(startMs, endMs, v, v, v, v) as { id: number }[];
+    if (hits.length > 0) {
+      credentialHits.push({ credential_id: c.id, event_ids: hits.map((h) => h.id) });
+    }
+  }
+
+  const lines: string[] = [];
+  lines.push(formatHeader("Honesty Audit", startSec, endSec, verify, genesisHash));
+  lines.push(
+    "## Honesty Invariant Verification",
+    "Warden enforces: no raw credential value appears in any emitted event.",
+    "",
+    "### Hash chain integrity",
+    `- Chain genesis: ${genesisHash.slice(0, 16)}`,
+    `- Chain head event id: ${state?.last_event_id ?? 0}`,
+    `- Chain head hash: ${(state?.last_event_hash ?? "").slice(0, 16)}`,
+    `- Chain started at: ${fmtTs(state?.chain_started_at ?? 0, true)}`,
+    `- Total chained events: ${verify.valid ? verify.events_verified : verify.events_verified}`,
+    `- Verification result: ${
+      verify.valid
+        ? "VALID"
+        : `BROKEN at event ${verify.break_at} (${verify.break_reason})`
+    }`,
+    "",
+    "### Assertion coverage",
+    `- Total events emitted in period: ${totalInPeriod.n}`,
+    `- Events excluded from chain (pre-migration, hash_version IS NULL or hash missing): ${excluded.n}`,
+    `- Events chained under V1 serialization: ${v1Count.n}`,
+    `- Events chained under V2 serialization: ${v2Count.n}`,
+    "",
+    "### Sampled integrity check",
+    `- Sample size: ${sample.length}`,
+    `- Pass: ${samplePass} / ${sample.length}`,
+    `- Fail: ${sampleFail} / ${sample.length}`
+  );
+  if (sampleFailures.length > 0) {
+    lines.push(`- Failed event ids: ${sampleFailures.join(", ")}`);
+  }
+  lines.push("", "### Raw-credential scan");
+  lines.push(`- Credentials scanned: ${creds.length}`);
+  if (credentialHits.length === 0) {
+    lines.push("- Matches found: **0** (honesty invariant holds)");
+  } else {
+    lines.push(`- Matches found: **${credentialHits.length}** — HONESTY VIOLATION detected`);
+    for (const h of credentialHits) {
+      lines.push(
+        `  - credential_id \`${h.credential_id}\`: event ids ${h.event_ids.join(", ")} (raw value not included in this report)`
+      );
+    }
+  }
+
+  return {
+    markdown: lines.join("\n") + "\n",
+    events_scanned: totalInPeriod.n,
+    total_capabilities_in_period: 0,
+  };
+}
+
+// ——— Report 5: FRAMEWORK_SPECIFIC ———
+function reportFrameworkSpecific(opts: {
+  startSec: number;
+  endSec: number;
+  framework: string;
+}): {
+  markdown: string;
+  events_scanned: number;
+  total_capabilities_in_period: number;
+} {
+  const { startSec, endSec, framework } = opts;
+  const verify = verifyChainInternal();
+  const genesisHash = getGenesisHash();
+  const frameworks = policyConfig.compliance_frameworks ?? {};
+  const fw = frameworks[framework];
+
+  const caps = db
+    .prepare(
+      `SELECT c.*, r.task AS run_task, r.environment AS run_environment, r.agent_identity
+         FROM capabilities c
+         LEFT JOIN runs r ON r.id = c.run_id
+         WHERE c.granted_at >= ? AND c.granted_at <= ?
+         ORDER BY c.granted_at DESC`
+    )
+    .all(startSec, endSec) as any[];
+  const filtered = caps.filter((c) => parseTagsJson(c.compliance_tags).includes(framework));
+
+  // Tool calls tagged with this framework (inherited via capability_id).
+  const startMs = startSec * 1000;
+  const endMs = endSec * 1000;
+  const toolEvents = db
+    .prepare(
+      `SELECT e.id, e.ts, e.tool, e.outcome, e.duration_ms, e.args_redacted, e.compliance_tags,
+              r.task AS run_task
+         FROM events e
+         LEFT JOIN runs r ON r.id = e.run_id
+         WHERE e.event_type = 'tool_called'
+           AND e.ts >= ? AND e.ts <= ?`
+    )
+    .all(startMs, endMs) as any[];
+  const toolsFiltered = toolEvents.filter((e) =>
+    parseTagsJson(e.compliance_tags).includes(framework)
+  );
+
+  // Runs that touched this framework (had at least one capability under it).
+  const runIdsWithFramework = new Set(filtered.map((c) => c.run_id).filter(Boolean));
+  let flags: any[] = [];
+  if (runIdsWithFramework.size > 0) {
+    const placeholders = Array.from(runIdsWithFramework).map(() => "?").join(",");
+    flags = db
+      .prepare(
+        `SELECT f.*, r.task AS run_task
+           FROM escape_hatch_flags f
+           LEFT JOIN runs r ON r.id = f.run_id
+          WHERE f.run_id IN (${placeholders})
+            AND f.raised_at >= ? AND f.raised_at <= ?
+          ORDER BY f.raised_at DESC`
+      )
+      .all(...Array.from(runIdsWithFramework), startSec, endSec) as any[];
+  }
+
+  const lines: string[] = [];
+  lines.push(formatHeader(`Framework Report: ${framework}`, startSec, endSec, verify, genesisHash));
+  lines.push(`## Framework: ${framework}`);
+  if (fw) {
+    lines.push(`- Description: ${fw.description}`);
+    lines.push(
+      `- Required justification fields: ${
+        fw.required_justification_fields.length
+          ? fw.required_justification_fields.join(", ")
+          : "(none)"
+      }`
+    );
+    lines.push(`- Audit retention days: ${fw.audit_retention_days}`);
+    lines.push(
+      `- Approval required on request: ${fw.require_approval_on_request ? "yes" : "no"}`
+    );
+  } else {
+    lines.push("- (framework definition unavailable)");
+  }
+  lines.push("");
+  lines.push("## Capabilities under this framework");
+  if (filtered.length === 0) {
+    lines.push("_No capabilities under this framework in the period._");
+  } else {
+    lines.push(
+      "| Run Task | Environment | Capability | Scope | TTL | Granted At | Compliance Tags | Justification |"
+    );
+    lines.push("| --- | --- | --- | --- | --- | --- | --- | --- |");
+    for (const c of filtered) {
+      const ttl = Math.max(0, (c.expires_at ?? 0) - (c.granted_at ?? 0));
+      const tags = parseTagsJson(c.compliance_tags);
+      const just = c.compliance_justification ?? c.justification;
+      lines.push(
+        `| ${mdEscape(c.run_task ?? "—")} | ${mdEscape(c.run_environment ?? "—")} | ${mdEscape(
+          c.cap_type
+        )} | ${mdEscape(c.scope)} | ${ttl}s | ${fmtTs(c.granted_at, true)} | ${mdEscape(
+          tags.join(",")
+        )} | ${mdEscape(justificationInline(just))} |`
+      );
+    }
+  }
+  lines.push("");
+  lines.push("## Actions taken under this framework");
+  if (toolsFiltered.length === 0) {
+    lines.push("_No tool calls under this framework in the period._");
+  } else {
+    lines.push("| Timestamp | Run Task | Tool | Outcome | Duration (ms) | Args (redacted) |");
+    lines.push("| --- | --- | --- | --- | --- | --- |");
+    for (const e of toolsFiltered) {
+      lines.push(
+        `| ${fmtTs(e.ts)} | ${mdEscape(e.run_task ?? "—")} | ${mdEscape(
+          e.tool ?? "—"
+        )} | ${e.outcome} | ${e.duration_ms ?? "—"} | ${mdEscape(
+          truncate(e.args_redacted ?? "—", 80)
+        )} |`
+      );
+    }
+  }
+  lines.push("");
+  lines.push("## Flags raised on runs touching this framework");
+  if (flags.length === 0) {
+    lines.push("_No flags raised on these runs in the period._");
+  } else {
+    lines.push("| Raised At | Run Task | Rule | Level | Acknowledged |");
+    lines.push("| --- | --- | --- | --- | --- |");
+    for (const f of flags) {
+      lines.push(
+        `| ${fmtTs(f.raised_at, true)} | ${mdEscape(f.run_task ?? "—")} | ${f.rule_name} | ${f.level} | ${
+          f.acknowledged_at ? fmtTs(f.acknowledged_at, true) : "—"
+        } |`
+      );
+    }
+  }
+
+  return {
+    markdown: lines.join("\n") + "\n",
+    events_scanned: toolsFiltered.length,
+    total_capabilities_in_period: filtered.length,
+  };
+}
+
+// ——— Report 6: RETENTION_COMPLIANCE ———
+function reportRetentionCompliance(opts: { startSec: number; endSec: number }): {
+  markdown: string;
+  events_scanned: number;
+  total_capabilities_in_period: number;
+} {
+  const { startSec, endSec } = opts;
+  const verify = verifyChainInternal();
+  const genesisHash = getGenesisHash();
+  const frameworks = policyConfig.compliance_frameworks ?? {};
+
+  const lines: string[] = [];
+  lines.push(formatHeader("Retention Compliance Check", startSec, endSec, verify, genesisHash));
+  lines.push("## Retention Compliance Check");
+  lines.push(
+    "For each framework, events older than `audit_retention_days` that still exist in the events table.",
+    "A real system would auto-purge or archive. MVP just reports them.",
+    ""
+  );
+
+  const nowMs = Date.now();
+  let totalScanned = 0;
+  for (const [name, fw] of Object.entries(frameworks)) {
+    const cutoffMs = nowMs - fw.audit_retention_days * 24 * 3600 * 1000;
+    // Events tagged with this framework, older than cutoff.
+    const rows = db
+      .prepare(
+        `SELECT id, ts FROM events
+           WHERE ts < ?
+             AND compliance_tags IS NOT NULL
+             AND instr(compliance_tags, ?) > 0`
+      )
+      .all(cutoffMs, `"${name}"`) as { id: number; ts: number }[];
+    totalScanned += rows.length;
+    lines.push(`### ${name}: ${fw.audit_retention_days} days`);
+    lines.push(`- Events exceeding retention: ${rows.length}`);
+    if (rows.length > 0) {
+      const oldest = rows.reduce((a, b) => (a.ts < b.ts ? a : b));
+      lines.push(`- Oldest event: ${fmtTs(oldest.ts)}, event id ${oldest.id}`);
+    }
+    lines.push("");
+  }
+
+  const oldest = db
+    .prepare("SELECT id, ts FROM events ORDER BY ts ASC LIMIT 1")
+    .get() as { id: number; ts: number } | undefined;
+  const untagged = db
+    .prepare("SELECT COUNT(*) AS n FROM events WHERE compliance_tags IS NULL")
+    .get() as { n: number };
+
+  lines.push("### Overall");
+  if (oldest) {
+    lines.push(`- Oldest event in DB: ${fmtTs(oldest.ts)}, id ${oldest.id}`);
+  } else {
+    lines.push("- Oldest event in DB: (none)");
+  }
+  lines.push(
+    `- Events with no compliance_tags (retention policy: indefinite for MVP): ${untagged.n}`
+  );
+
+  return { markdown: lines.join("\n") + "\n", events_scanned: totalScanned, total_capabilities_in_period: 0 };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Report HTTP endpoints
+// ─────────────────────────────────────────────────────────────
+
+app.get("/api/reports/types", (_req: Request, res: Response) => {
+  res.json({ reports: REPORT_DEFS });
+});
+
+app.post("/api/reports/generate", (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as {
+    report_type?: string;
+    period_start?: number;
+    period_end?: number;
+    framework?: string;
+  };
+  const reportType = body.report_type as ReportType | undefined;
+  if (!reportType || !REPORT_TYPE_SET.has(reportType)) {
+    return res.status(400).json({
+      error: "invalid_report_type",
+      message: `report_type must be one of: ${Array.from(REPORT_TYPE_SET).join(", ")}`,
+      received: reportType ?? null,
+    });
+  }
+
+  const nowSecVal = nowSec();
+  const rawEnd = typeof body.period_end === "number" ? body.period_end : nowSecVal;
+  const rawStart =
+    typeof body.period_start === "number" ? body.period_start : nowSecVal - 24 * 3600;
+  // Normalize any accidental ms-valued inputs (> 10^12) to seconds.
+  const normalize = (n: number) => (n > 10_000_000_000 ? Math.floor(n / 1000) : n);
+  const startSec = normalize(rawStart);
+  const endSec = normalize(rawEnd);
+
+  let framework: string | undefined;
+  const frameworks = policyConfig.compliance_frameworks ?? {};
+  if (reportType === "FRAMEWORK_SPECIFIC") {
+    framework = typeof body.framework === "string" ? body.framework : undefined;
+    if (!framework) {
+      return res.status(400).json({
+        error: "framework_required",
+        message: "FRAMEWORK_SPECIFIC requires a framework parameter",
+      });
+    }
+    if (!frameworks[framework]) {
+      return res.status(400).json({
+        error: "unknown_framework",
+        message: `unknown framework '${framework}'`,
+        known: Object.keys(frameworks),
+      });
+    }
+  } else if (reportType === "ACCESS_SUMMARY" && typeof body.framework === "string") {
+    if (!frameworks[body.framework]) {
+      return res.status(400).json({
+        error: "unknown_framework",
+        message: `unknown framework '${body.framework}'`,
+        known: Object.keys(frameworks),
+      });
+    }
+    framework = body.framework;
+  }
+
+  let built: {
+    markdown: string;
+    events_scanned: number;
+    total_capabilities_in_period: number;
+  };
+  try {
+    switch (reportType) {
+      case "ACCESS_SUMMARY":
+        built = reportAccessSummary({ startSec, endSec, framework });
+        break;
+      case "DENIED_ACCESS_SUMMARY":
+        built = reportDeniedAccessSummary({ startSec, endSec });
+        break;
+      case "ESCAPE_HATCH_AUDIT":
+        built = reportEscapeHatchAudit({ startSec, endSec });
+        break;
+      case "HONESTY_AUDIT":
+        built = reportHonestyAudit({ startSec, endSec });
+        break;
+      case "FRAMEWORK_SPECIFIC":
+        built = reportFrameworkSpecific({ startSec, endSec, framework: framework! });
+        break;
+      case "RETENTION_COMPLIANCE":
+        built = reportRetentionCompliance({ startSec, endSec });
+        break;
+      default:
+        return res.status(400).json({ error: "invalid_report_type" });
+    }
+  } catch (err: any) {
+    console.error("[reports] generation error", err);
+    return res.status(500).json({ error: "report_generation_failed", message: String(err?.message ?? err) });
+  }
+
+  // Defensive: run the credential sanitizer over the markdown in case any field
+  // accidentally rendered a raw credential value. Honesty assertion should make
+  // this a no-op, but this is a new read path; belt-and-suspenders.
+  const { sanitized: sanitizedMarkdown, redactions } = sanitize(built.markdown);
+
+  const verify = verifyChainInternal();
+  res.setHeader("Content-Type", "application/json");
+  res.json({
+    report_id: randomUUID(),
+    report_type: reportType,
+    generated_at: nowSec(),
+    period: { start: startSec, end: endSec },
+    markdown: sanitizedMarkdown,
+    metadata: {
+      events_scanned: built.events_scanned,
+      chain_status: chainStatusString(verify),
+      total_capabilities_in_period: built.total_capabilities_in_period,
+      sanitizer_redactions: redactions,
+    },
+  });
+});
+
 // ─────────────────────────────────────────────────────────────
 // Timeout sweep — auto-end runs older than 1 hour
 // ─────────────────────────────────────────────────────────────
